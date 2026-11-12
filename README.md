@@ -11,7 +11,7 @@ For each profile, in `data/<profile>/`:
 - `runs.csv`, `laps.csv` and `records/<file>.csv` with every field the watch recorded, per run, per lap and per second.
 - `digest.md`, a weekly summary plus one row per run, written to be read in one pass by you or a model.
 - `dashboard.html`, with weekly minutes split by effort, a per-run trend chart where you pick the measure, pace in each heart rate zone, and your latest runs.
-- `coach.md`, the latest coaching review with a two-week plan.
+- `coach.md`, the latest coaching review with a two-week plan, and `coach/`, every review you've had, dated.
 
 The script computes a few numbers the watch doesn't show you directly:
 
@@ -50,7 +50,7 @@ The dashboard server has buttons for fetching new runs, switching profiles, edit
 
 ## Coach reviews
 
-`coach` sends Claude the prompt in `coach_prompt.md` along with your goal, your notes, the previous review and the digest. It writes the answer to `coach.md`.
+`coach` sends Claude the prompt in `coach_prompt.md` along with your goal, your notes, the previous review and the digest. It writes the answer to `coach.md` and keeps a dated copy in `coach/`. The Coach dialog on the dashboard has arrows to step back through older reviews.
 
 Write your goal in `data/<profile>/goal.txt` or on the dashboard. To tell the coach something the watch can't see, add a note:
 

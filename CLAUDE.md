@@ -24,7 +24,7 @@ There is no test suite or linter. `demo()` at the bottom of `garmin.py` holds as
 
 Everything is in `garmin.py`. `dashboard.html` is a template, not a page: `render()` substitutes the literal markers `/*DATA*/[]`, `/*ZONES*/[]` and `/*NAME*/` and writes the result to `data/<profile>/dashboard.html`. Keep those markers intact when editing the template. The page renders fine with empty data, which `serve` relies on for a profile with no runs yet.
 
-`data/` is gitignored and holds personal data. Per profile it contains `raw/`, the CSVs, `digest.md`, `dashboard.html`, `watch.txt` (serial of the watch first pulled into it), `goal.txt`, `notes.md` (runner notes appended on each coach call), `coach.md` (last review) and `coach_request.md` (the full prompt last sent).
+`data/` is gitignored and holds personal data. Per profile it contains `raw/`, the CSVs, `digest.md`, `dashboard.html`, `watch.txt` (serial of the watch first pulled into it), `goal.txt`, `notes.md` (runner notes appended on each coach call), `coach.md` (last review, the one fed into the next prompt), `coach/<YYYY-MM-DD-HHMMSS>.md` (every review, browsable in the dashboard) and `coach_request.md` (the full prompt last sent).
 
 ## Things that span several functions
 
@@ -33,4 +33,4 @@ Everything is in `garmin.py`. `dashboard.html` is a template, not a page: `rende
 - **Walking is cadence-based.** `WALK_CADENCE` (strides/min, one foot) splits walking from running. Walk %, longest unbroken run, zone paces and drift all depend on it.
 - **Wrong-watch guards.** `pull()` refuses to pull if the connected watch serial differs from `watch.txt`; `parse()` warns if the raw files come from more than one watch.
 - **Coach review** shells out to the logged-in `claude` CLI (`claude -p --model $COACH_MODEL`), not the API. The prompt is `coach_prompt.md` plus today's date, goal, notes, the previous review and the digest. Changing the digest's columns means checking that `coach_prompt.md` still describes them correctly.
-- **Server API** (`serve`): `GET /api/profiles`, `GET /api/{coach,goal}/<p>`, `POST /api/{pull,coach,goal}/<p>`. POSTs require the header `X-Garmin: 1` as a CSRF guard; the dashboard's JS sends it. It binds to 127.0.0.1 only.
+- **Server API** (`serve`): `GET /api/profiles`, `GET /api/goal/<p>`, `GET /api/reviews/<p>` (all reviews, newest first), `POST /api/{pull,coach,goal}/<p>`. POSTs require the header `X-Garmin: 1` as a CSRF guard; the dashboard's JS sends it. It binds to 127.0.0.1 only.

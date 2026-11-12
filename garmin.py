@@ -221,10 +221,14 @@ def serve(port=8765):
             profiles = sorted(d.name for d in data.iterdir() if d.is_dir()) if data.exists() else []
             if self.path == "/api/profiles":
                 return self.reply(profiles)
-            m = re.fullmatch(r"/api/(coach|goal)/(\w+)", self.path)
+            m = re.fullmatch(r"/api/goal/(\w+)", self.path)
             if m:
-                f = data / m[2] / ("coach.md" if m[1] == "coach" else "goal.txt")
+                f = data / m[1] / "goal.txt"
                 return self.reply(f.read_text() if f.exists() else "", "text/plain; charset=utf-8")
+            m = re.fullmatch(r"/api/reviews/(\w+)", self.path)
+            if m:  # newest first
+                files = sorted((data / m[1] / "coach").glob("*.md"), reverse=True)
+                return self.reply([{"name": f.stem, "text": f.read_text()} for f in files])
             m = re.fullmatch(r"/p/(\w+)", self.path)
             if not m:
                 self.send_response(302)
@@ -297,7 +301,11 @@ def coach(note=""):
     if out.returncode or not out.stdout.strip():
         sys.exit(f"Claude failed: {out.stderr.strip() or 'empty answer'}. The prompt is in {sent}.")
     text = re.sub(r"\A#[^\n]*\n+", "", out.stdout.strip())  # it sometimes repeats the previous review's title
-    (DATA / "coach.md").write_text(f"# Coach review: {DATA.name}, {datetime.now():%Y-%m-%d}\n\n{text}\n")
+    now = datetime.now()
+    review = f"# Coach review: {DATA.name}, {now:%Y-%m-%d}\n\n{text}\n"
+    (DATA / "coach.md").write_text(review)  # the latest, which the next prompt includes
+    (DATA / "coach").mkdir(exist_ok=True)
+    (DATA / "coach" / f"{now:%Y-%m-%d-%H%M%S}.md").write_text(review)  # every review, for the dashboard's history
     print(text, f"\n\nSaved to {DATA / 'coach.md'}")
 
 
