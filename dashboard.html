@@ -29,6 +29,17 @@ body {
   display: grid; grid-template-rows: auto auto minmax(0, 1fr) minmax(0, 1fr); gap: 12px; padding: 14px 16px; overflow: hidden;
 }
 header { display: flex; align-items: baseline; gap: 12px; }
+#ctl { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+#ctl[hidden] { display: none; }
+#ctl select, #ctl input, #ctl button { font: inherit; color: var(--ink); background: var(--surface); border: 1px solid var(--axis); border-radius: 6px; padding: 3px 8px; }
+#ctl button { background: var(--series); border-color: var(--series); color: #fff; cursor: pointer; }
+#ctl button:disabled { opacity: .6; cursor: wait; }
+.pick { font: inherit; color: var(--ink); background: var(--surface); border: 1px solid var(--axis); border-radius: 6px; padding: 2px 6px; }
+.chips { display: flex; gap: 4px; }
+.chips button { font: inherit; color: var(--ink2); background: none; border: 1px solid var(--axis); border-radius: 6px; padding: 1px 8px; cursor: pointer; }
+.chips button[aria-pressed="true"] { background: var(--series); border-color: var(--series); color: #fff; }
+.chips button:disabled { opacity: .35; cursor: default; }
+#msg { color: var(--ink2); max-width: 46ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 h1 { font-size: 17px; margin: 0; font-weight: 600; }
 header span, .sub { color: var(--ink2); }
 .tiles { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
@@ -57,7 +68,11 @@ th:first-child, td:first-child { text-align: left; padding-left: 0; }
 </style>
 </head>
 <body>
-<header><h1>Running: /*NAME*/</h1><span id="range"></span></header>
+<header><h1>Running: /*NAME*/</h1><span id="range"></span>
+  <div id="ctl" hidden><span id="msg" role="status"></span>
+    <label>Profile <select id="profile"></select></label>
+    <input id="newp" size="14" placeholder="or new profile" aria-label="New profile name">
+    <button id="fetch"></button></div></header>
 <section class="tiles" id="tiles"></section>
 <section class="row" style="grid-template-columns: 1fr">
   <div class="card">
@@ -67,17 +82,17 @@ th:first-child, td:first-child { text-align: left; padding-left: 0; }
   </div>
 </section>
 <section class="row">
-  <div class="card"><div class="head"><h2>Share of each run spent running</h2><span class="sub">last 12 weeks</span></div><div class="plot" id="running"></div></div>
-  <div class="card"><div class="head"><h2>Pace at zone 2 heart rate</h2><span class="sub">per km, faster is up, last 12 weeks</span></div><div class="plot" id="z2"></div></div>
+  <div class="card"><div class="head"><select class="pick" id="metric" aria-label="Measure to plot per run"></select><span class="sub">last 12 weeks</span></div><div class="plot" id="trend"></div></div>
+  <div class="card"><div class="head"><h2>Pace by heart rate zone, last 12 weeks</h2><div class="chips" id="zones" role="group" aria-label="Heart rate zone"></div></div><div class="sub" id="zonesub"></div><div class="plot" id="zpace"></div></div>
   <div class="card"><div class="head"><h2>Latest runs</h2></div><div class="plot" id="latest"></div></div>
 </section>
 <div id="tip"></div>
 <script>
 const RUNS = /*DATA*/[];
-const TARGET_MIN = 30;  // unbroken-run milestone shown on the first tile
+const ZONE_TOP = /*ZONES*/[];  // upper bpm of zones 0-5, the same for every run
 const DAY = 864e5;
 
-RUNS.forEach(r => r.t = new Date(r.date));
+RUNS.forEach(r => { r.t = new Date(r.date); r.easy = r.zm[0] + r.zm[1] + r.zm[2]; r.mod = r.zm[3]; r.hard = r.zm[4] + r.zm[5] + r.zm[6]; });
 const pace = p => { if (p == null) return "–"; const s = Math.round(p * 60); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; };
 const day = t => t.toLocaleDateString("en-GB", { day: "numeric", month: "short", timeZone: "UTC" });
 const monday = t => { const d = new Date(Date.UTC(t.getUTCFullYear(), t.getUTCMonth(), t.getUTCDate())); return +d - ((d.getUTCDay() + 6) % 7) * DAY; };
@@ -85,6 +100,29 @@ const avg = a => a.length ? a.reduce((x, y) => x + y, 0) / a.length : null;
 const last = RUNS.length ? +RUNS[RUNS.length - 1].t : Date.now();
 const within = (r, from, to) => last - r.t >= from * DAY && last - r.t < to * DAY;
 const recent = RUNS.filter(r => within(r, 0, 84));
+const median = a => { const s = [...a].sort((x, y) => x - y); return s.length ? s[s.length >> 1] : null; };
+
+// ---- what the two lower charts show. Chosen per runner from their data, then remembered per profile.
+// name, value per run, tick format, tooltip unit, y-range: [lo, hi] fixed | 0 = from zero | "flip" = padded, small on top | none = padded
+const METRICS = {
+  runpct: ["Share of run spent running", r => r.walk == null ? null : 100 - r.walk, v => v.toFixed(0) + "%", "running", [0, 100]],
+  longest: ["Longest unbroken run", r => r.longest, v => v.toFixed(0), "min unbroken", 0],
+  km: ["Distance", r => r.km || null, v => String(+v.toFixed(1)), "km", 0],
+  min: ["Duration", r => r.min, v => v.toFixed(0), "min", 0],
+  pace: ["Average pace", r => r.pace, v => pace(v), "/km", "flip"],
+  hr: ["Average heart rate", r => r.hr, v => v.toFixed(0), "bpm"],
+  cad: ["Cadence", r => r.cad, v => v.toFixed(0), "steps/min"],
+};
+const KEY = "garmin:/*NAME*/";
+let saved = {}; try { saved = JSON.parse(localStorage.getItem(KEY)) || {}; } catch {}
+const zoneMin = z => recent.reduce((s, r) => s + r.zm[z], 0);
+const state = {
+  // run/walkers start on the running share, continuous runners on distance
+  metric: METRICS[saved.metric] ? saved.metric : median(recent.map(r => r.walk ?? 0)) > 10 ? "runpct" : "km",
+  // start on the zone this runner spends most time in
+  zone: saved.zone >= 1 && saved.zone <= 5 ? saved.zone : [1, 2, 3, 4, 5].reduce((a, b) => zoneMin(b) > zoneMin(a) ? b : a),
+};
+const save = () => { try { localStorage.setItem(KEY, JSON.stringify(state)); } catch {} };
 
 // ---- tooltip
 const tip = document.getElementById("tip");
@@ -101,25 +139,25 @@ function hover(el, html) {
 function tiles() {
   const a = RUNS.filter(r => within(r, 0, 28)), b = RUNS.filter(r => within(r, 28, 56));
   const stat = rs => ({
-    long: rs.length ? Math.max(...rs.map(r => r.longest ?? 0)) : null,
-    z2: avg(rs.filter(r => r.z2pace != null).map(r => r.z2pace)),
     perWeek: rs.length / 4,
+    km: rs.reduce((s, r) => s + r.km, 0) / 4,
+    zp: avg(rs.filter(r => r.zp[state.zone] != null).map(r => r.zp[state.zone])),
     easy: (() => { const t = rs.reduce((s, r) => s + r.easy + r.mod + r.hard, 0); return t ? 100 * rs.reduce((s, r) => s + r.easy, 0) / t : null; })(),
   });
   const A = stat(a), B = stat(b);
   // delta(): diff vs the 4 weeks before; `better` is +1 if a higher number is good, -1 if lower is
   const delta = (x, y, fmt, better, step = 1) => {
     if (x == null || y == null || !b.length) return `<span class="delta">no earlier 4 weeks to compare</span>`;
-    const d = Math.round((x - y) / step) * step, cls = d * better > 0 ? "up" : "down";
+    const d = Math.round((x - y) / step) * step, cls = !better ? "" : d * better > 0 ? "up" : "down";
     if (!d) return `<span class="delta">same as 4 weeks before</span>`;
-    return `<span class="delta"><b class="${cls}">${d > 0 ? "▲" : d < 0 ? "▼" : "•"} ${fmt(Math.abs(d))}</b> vs 4 weeks before</span>`;
+    return `<span class="delta"><b class="${cls}">${d > 0 ? "▲" : "▼"} ${fmt(Math.abs(d))}</b> vs 4 weeks before</span>`;
   };
   const T = [
-    ["Longest unbroken run", A.long == null ? "–" : A.long.toFixed(0) + "<small>of " + TARGET_MIN + " min</small>",
-      `<div class="meter"><i style="width:${Math.min(100, 100 * (A.long ?? 0) / TARGET_MIN)}%"></i></div>` + delta(A.long, B.long, d => d.toFixed(0) + " min", 1)],
-    ["Pace at zone 2 heart rate", pace(A.z2) + "<small>/km</small>", delta(A.z2, B.z2, d => pace(d), -1, 1 / 60).replace("▲", "slower by").replace("▼", "faster by")],
     ["Runs per week", A.perWeek.toFixed(1), delta(A.perWeek, B.perWeek, d => d.toFixed(1), 1, .1)],
-    ["Time at easy effort", A.easy == null ? "–" : A.easy.toFixed(0) + "<small>% in zone 1–2</small>", delta(A.easy, B.easy, d => d.toFixed(0) + " pts", 1)],
+    ["Distance per week", A.km.toFixed(1) + "<small>km</small>", delta(A.km, B.km, d => d.toFixed(1) + " km", 1, .1)],
+    [`Pace in zone ${state.zone}`, pace(A.zp) + "<small>/km</small>", delta(A.zp, B.zp, d => pace(d), -1, 1 / 60).replace("▲", "slower by").replace("▼", "faster by")],
+    // more easy time is not better or worse in itself, so this delta carries no good/bad colour
+    ["Time at easy effort", A.easy == null ? "–" : A.easy.toFixed(0) + "<small>% in zone 1–2</small>", delta(A.easy, B.easy, d => d.toFixed(0) + " pts", 0)],
   ];
   document.getElementById("tiles").innerHTML = T.map(([l, v, d]) => `<div class="card tile"><div class="sub">${l}, last 4 weeks</div><div class="v">${v}</div>${d}</div>`).join("");
   if (RUNS.length) document.getElementById("range").textContent = `${RUNS.length} runs, ${day(RUNS[0].t)} to ${day(new Date(last))} ${new Date(last).getUTCFullYear()}`;
@@ -173,31 +211,69 @@ function weeks() {
   monthLabels(f, w0, w0 + n * 7 * DAY, t => f.m.l + (t - w0) / (7 * DAY) * band);
 }
 
-// ---- one dot per run over the last 12 weeks
-function dots(id, key, { lo, hi, fmt, flip, label }) {
-  const pts = recent.filter(r => r[key] != null);
+// ---- one dot per run over the last 12 weeks. range: [lo, hi] | 0 | "flip" | undefined (see METRICS)
+function dots(id, get, fmt, unit, range) {
+  const pts = recent.filter(r => get(r) != null), vals = pts.map(get), flip = range === "flip";
+  let lo = 0, hi = 1;
+  if (Array.isArray(range)) [lo, hi] = range;
+  else if (vals.length) {
+    const mn = Math.min(...vals), mx = Math.max(...vals), pad = Math.max((mx - mn) * .15, mx * .03);
+    lo = range === 0 ? 0 : mn - pad; hi = mx + pad;
+  }
   const f = frame(id, lo, hi, fmt, flip);
   const t0 = last - 84 * DAY, x = t => f.m.l + 8 + (t - t0) / (84 * DAY) * (f.W - f.m.l - f.m.r - 16);
   monthLabels(f, t0, last, x);
-  if (pts.length > 1) S(f.svg, "path", { d: "M" + pts.map(r => `${x(+r.t)},${f.y(r[key])}`).join("L"), fill: "none", stroke: "var(--series)", "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" });
+  if (pts.length > 1) S(f.svg, "path", { d: "M" + pts.map(r => `${x(+r.t)},${f.y(get(r))}`).join("L"), fill: "none", stroke: "var(--series)", "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" });
   for (const r of pts) {
-    S(f.svg, "circle", { cx: x(+r.t), cy: f.y(r[key]), r: 4.5, fill: "var(--series)", stroke: "var(--surface)", "stroke-width": 2 });
-    hover(S(f.svg, "circle", { cx: x(+r.t), cy: f.y(r[key]), r: 12, fill: "transparent" }), `<b>${day(r.t)}</b> · ${label(r)}<br>${r.min.toFixed(0)} min, ${r.km.toFixed(1)} km at ${pace(r.pace)}/km`);
+    S(f.svg, "circle", { cx: x(+r.t), cy: f.y(get(r)), r: 4.5, fill: "var(--series)", stroke: "var(--surface)", "stroke-width": 2 });
+    hover(S(f.svg, "circle", { cx: x(+r.t), cy: f.y(get(r)), r: 12, fill: "transparent" }), `<b>${day(r.t)}</b> · ${fmt(get(r))} ${unit}<br>${r.min.toFixed(0)} min, ${r.km.toFixed(1)} km at ${pace(r.pace)}/km`);
   }
   if (!pts.length) S(f.svg, "text", { x: f.W / 2, y: f.H / 2, "text-anchor": "middle" }, "No runs with this measure in the last 12 weeks");
 }
+function controls() {
+  const sel = document.getElementById("metric"), chips = document.getElementById("zones");
+  sel.innerHTML = Object.entries(METRICS).map(([k, m]) => `<option value="${k}"${k === state.metric ? " selected" : ""}>${m[0]}</option>`).join("");
+  sel.onchange = () => { state.metric = sel.value; save(); charts(); };
+  chips.innerHTML = [1, 2, 3, 4, 5].map(z => `<button data-z="${z}" aria-pressed="${z === state.zone}"${recent.some(r => r.zp[z] != null) ? "" : " disabled"}>Z${z}</button>`).join("");
+  chips.onclick = e => { const z = +e.target.dataset.z; if (!z) return; state.zone = z; save(); controls(); controls(); tiles(); charts(); };
+  const z = state.zone, bpm = ZONE_TOP.length > z ? `Zone ${z} is ${ZONE_TOP[z - 1] + 1}–${ZONE_TOP[z]} bpm. ` : "";
+  document.getElementById("zonesub").textContent = bpm + "Faster is up.";
+}
 function charts() {
   weeks();
-  recent.forEach(r => r.runpct = r.walk == null ? null : 100 - r.walk);
-  dots("running", "runpct", { lo: 0, hi: 100, fmt: v => v.toFixed(0) + "%", label: r => `${r.runpct.toFixed(0)}% running, longest stretch ${r.longest.toFixed(0)} min` });
-  const z = recent.filter(r => r.z2pace != null).map(r => r.z2pace), lo = z.length ? Math.min(...z) - .25 : 6, hi = z.length ? Math.max(...z) + .25 : 9;
-  dots("z2", "z2pace", { lo, hi, fmt: pace, flip: true, label: r => `${pace(r.z2pace)}/km in zone 2` });
+  const m = METRICS[state.metric];
+  dots("trend", m[1], m[2], m[3], m[4]);
+  dots("zpace", r => r.zp[state.zone], pace, `/km in zone ${state.zone}`, "flip");
   // table: as many of the newest runs as fit the card
   const el = document.getElementById("latest"), rows = Math.max(1, Math.floor((el.clientHeight - 24) / 27));
   el.innerHTML = `<table><tr><th>Date</th><th>Min</th><th>Km</th><th>Pace</th><th>Avg HR</th><th>Easy</th><th>Unbroken</th><th>Walk</th></tr>` +
     RUNS.slice(-rows).reverse().map(r => { const t = r.easy + r.mod + r.hard; return `<tr><td>${day(r.t)}</td><td>${r.min.toFixed(0)}</td><td>${r.km.toFixed(1)}</td><td>${pace(r.pace)}</td><td>${r.hr ?? "–"}</td><td>${t ? (100 * r.easy / t).toFixed(0) + "%" : "–"}</td><td>${r.longest != null ? r.longest.toFixed(0) + " min" : "–"}</td><td>${r.walk != null ? r.walk.toFixed(0) + "%" : "–"}</td></tr>`; }).join("") + "</table>";
 }
-tiles(); charts();
+// ---- profile switcher + fetch button, only when served by `garmin.py serve` (a plain file can't run the pull)
+if (location.protocol.startsWith("http")) {
+  const me = "/*NAME*/", $ = id => document.getElementById(id), sel = $("profile"), newp = $("newp"), btn = $("fetch"), msg = $("msg");
+  const target = () => newp.value.trim() || sel.value || me;
+  const label = () => btn.textContent = `Fetch watch into "${target()}"`;
+  $("ctl").hidden = false; label(); newp.oninput = label;
+  msg.textContent = msg.title = sessionStorage.getItem("msg") || ""; sessionStorage.removeItem("msg");
+  fetch("/api/profiles").then(r => r.json()).then(ps => {
+    if (!ps.includes(me)) ps.push(me);
+    sel.innerHTML = ps.map(p => `<option${p === me ? " selected" : ""}>${p}</option>`).join(""); label();
+  });
+  sel.onchange = () => location.href = "/p/" + sel.value;
+  btn.onclick = async () => {
+    const p = target();
+    if (!/^\w+$/.test(p)) return msg.textContent = "Profile names use letters, numbers and underscores only";
+    btn.disabled = true; msg.textContent = "Fetching… about 20 seconds, or several minutes for a first pull";
+    try {
+      const r = await (await fetch("/api/pull/" + p, { method: "POST", headers: { "X-Garmin": "1" } })).json();
+      if (r.ok) { sessionStorage.setItem("msg", r.message); return location.href = "/p/" + p; }
+      msg.textContent = msg.title = r.message;
+    } catch { msg.textContent = "Could not reach garmin.py serve"; }
+    btn.disabled = false;
+  };
+}
+controls(); tiles(); charts();
 addEventListener("resize", charts);
 </script>
 </body>

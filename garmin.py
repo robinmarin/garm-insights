@@ -5,6 +5,8 @@
     .venv/bin/python garmin.py robin pull    # watch -> data/robin/raw/*.fit (only new files)
     .venv/bin/python garmin.py robin parse   # raw -> runs.csv, laps.csv, records/*.csv
 
+    .venv/bin/python garmin.py serve         # dashboard at http://127.0.0.1:8765 with a fetch button
+
 One profile per person; plug in one watch at a time and name whose it is.
 
 Needs: brew install libmtp; pip install garmin-fit-sdk
@@ -18,7 +20,27 @@ import subprocess
 import sys
 from pathlib import Path
 
-DATA = RAW = None  # set per profile in __main__
+ROOT = Path(__file__).parent
+DATA = RAW = None  # set by set_profile()
+
+
+def set_profile(name: str):
+    global DATA, RAW
+    if not re.fullmatch(r"\w+", name) or name in ("pull", "parse", "serve"):
+        sys.exit("usage: garmin.py <profile> [pull|parse]  |  garmin.py serve")
+    DATA = ROOT / "data" / name
+    RAW = DATA / "raw"
+
+
+def watch_serial(out: str | None = None) -> str | None:
+    """Serial of the plugged-in Garmin (USB vendor 0x091e), from macOS. None if it can't be read."""
+    if out is None:
+        out = subprocess.run(["ioreg", "-r", "-c", "IOUSBHostDevice", "-l", "-w", "0"], capture_output=True, text=True).stdout
+    for device in re.split(r"(?m)^\+-o ", out):  # one block per top-level USB device
+        m = re.search(r'"USB Serial Number" = "([^"]+)"', device)
+        if '"idVendor" = 2334' in device and m:
+            return m[1]
+    return None
 SEMI = 180 / 2**31  # FIT stores lat/long in semicircles
 WALK_CADENCE = 65  # strides/min (one foot), so 130 steps/min. Below this counts as walking; tune per runner.
 
@@ -39,11 +61,17 @@ def activity_files(tree: str) -> dict[str, str]:
 
 
 def pull():
-    RAW.mkdir(parents=True, exist_ok=True)
+    # Each profile remembers its watch, so plugging in the other person's can't mix two people's runs.
+    serial, known = watch_serial(), DATA / "watch.txt"
+    if serial and known.exists() and known.read_text().strip() != serial:
+        sys.exit(f"The connected watch ({serial}) is not the one profile '{DATA.name}' was pulled from before. Pick the right profile.")
     tree = subprocess.run(["mtp-filetree"], capture_output=True, text=True).stdout
     files = activity_files(tree)
     if not files:
         sys.exit("No activity files found. Is the watch plugged in and unlocked? (Close Garmin Express / Android File Transfer.)")
+    RAW.mkdir(parents=True, exist_ok=True)
+    if serial:
+        known.write_text(serial)
     todo = {n: i for n, i in files.items() if not (RAW / n).exists()}
     print(f"{len(files)} on watch, {len(todo)} new")
     for k, (name, oid) in enumerate(sorted(todo.items(), reverse=True), 1):  # newest first
@@ -75,22 +103,23 @@ def run_metrics(recs: list[dict], top: list) -> dict:
 
     top[i] is the upper bpm of zone i. The caller passes the same boundaries for every run.
     """
-    moving = walk = longest = cur = z2_t = z2_d = 0.0
-    z2 = (top[1], top[2]) if len(top) > 2 else None
-    zone_s = [0.0] * (len(top) + 1)
+    moving = walk = longest = cur = 0.0
+    zone_s = [0.0] * (len(top) + 1)  # all time with a heart rate
+    zone_t, zone_d = list(zone_s), list(zone_s)  # time and distance while moving, for pace per zone
     running = []  # (speed, hr) while running, for drift
     for a, b in zip(recs, recs[1:]):
         dt = min((b["timestamp"] - a["timestamp"]).total_seconds(), 10)  # cap pauses
         cad, v, hr = a.get("cadence"), a.get("enhanced_speed"), a.get("heart_rate")
-        if hr and top:
-            zone_s[next((i for i, t in enumerate(top) if hr <= t), len(top))] += dt
+        z = next((i for i, t in enumerate(top) if hr <= t), len(top)) if hr and top else None
+        if z is not None:
+            zone_s[z] += dt
         if not cad:  # standing still
             cur = 0
             continue
         moving += dt
-        if z2 and hr and v and z2[0] < hr <= z2[1]:
-            z2_t += dt
-            z2_d += v * dt
+        if z is not None and v:
+            zone_t[z] += dt
+            zone_d[z] += v * dt
         if cad < WALK_CADENCE:
             walk += dt
             cur = 0
@@ -103,8 +132,9 @@ def run_metrics(recs: list[dict], top: list) -> dict:
     out.update({f"hr_zone_{i}_s": round(s) for i, s in enumerate(zone_s)} if top else {})
     if moving:
         out["walk_pct"] = round(100 * walk / moving, 1)
-    if z2_t >= 120:
-        out["z2_pace_min_per_km"] = round(z2_t / 60 / (z2_d / 1000), 2)
+    for i, (t, d) in enumerate(zip(zone_t, zone_d)):
+        if t >= 120 and d:  # under 2 minutes in a zone is too little to call a pace
+            out[f"z{i}_pace_min_per_km"] = round(t / 60 / (d / 1000), 2)
     if len(running) >= 600:  # drift means little on anything shorter than ~10 min
         h = len(running) // 2
         ef = [sum(v for v, _ in part) / sum(hr for _, hr in part) for part in (running[:h], running[h:])]
@@ -147,15 +177,81 @@ def write_digest(runs: list[dict], top: list):
     (DATA / "digest.md").write_text("\n".join(L))
 
 
-def write_dashboard(runs: list[dict]):
+def write_dashboard(runs: list[dict], top: list):
     """Fill dashboard.html (the template next to this script) with this profile's runs."""
-    zmin = lambda r, zones: round(sum(r.get(f"hr_zone_{i}_s", 0) for i in zones) / 60, 1)
     rows = [{"date": r["start_time"].isoformat(), "min": round(r["total_timer_time"] / 60, 1), "km": r.get("distance_km", 0),
              "pace": r.get("pace_min_per_km"), "hr": r.get("avg_heart_rate"),
-             "easy": zmin(r, (0, 1, 2)), "mod": zmin(r, (3,)), "hard": zmin(r, (4, 5, 6)),
-             "longest": r.get("longest_run_min"), "walk": r.get("walk_pct"), "z2pace": r.get("z2_pace_min_per_km")} for r in runs]
-    tpl = (Path(__file__).parent / "dashboard.html").read_text()
-    (DATA / "dashboard.html").write_text(tpl.replace("/*DATA*/[]", json.dumps(rows)).replace("/*NAME*/", DATA.name))
+             "zm": [round(r.get(f"hr_zone_{i}_s", 0) / 60, 1) for i in range(7)],  # minutes in zones 0-6
+             "zp": [r.get(f"z{i}_pace_min_per_km") for i in range(6)],  # pace in zones 0-5
+             "longest": r.get("longest_run_min"), "walk": r.get("walk_pct"),
+             "cad": r["avg_running_cadence"] * 2 if r.get("avg_running_cadence") else None} for r in runs]
+    (DATA / "dashboard.html").write_text(render(rows, DATA.name, top))
+
+
+def render(rows: list, name: str, top: list = ()) -> str:
+    tpl = (ROOT / "dashboard.html").read_text()
+    return tpl.replace("/*DATA*/[]", json.dumps(rows)).replace("/*ZONES*/[]", json.dumps(list(top))).replace("/*NAME*/", name)
+
+
+def serve(port=8765):
+    """Local-only server: shows each profile's dashboard and lets its button run pull + parse."""
+    import contextlib
+    import io
+    import threading
+    import webbrowser
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    busy = threading.Lock()  # pull/parse use module globals, so one fetch at a time
+
+    class H(BaseHTTPRequestHandler):
+        def reply(self, body, ctype="application/json"):
+            body = body.encode() if isinstance(body, str) else json.dumps(body).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            data = ROOT / "data"
+            profiles = sorted(d.name for d in data.iterdir() if d.is_dir()) if data.exists() else []
+            if self.path == "/api/profiles":
+                return self.reply(profiles)
+            m = re.fullmatch(r"/p/(\w+)", self.path)
+            if not m:
+                self.send_response(302)
+                self.send_header("Location", f"/p/{profiles[0] if profiles else 'me'}")
+                return self.end_headers()
+            f = data / m[1] / "dashboard.html"
+            self.reply(f.read_text() if f.exists() else render([], m[1]), "text/html; charset=utf-8")
+
+        def do_POST(self):
+            m = re.fullmatch(r"/api/pull/(\w+)", self.path)
+            # The custom header can't be sent cross-site without a CORS preflight, so other web pages can't trigger a pull.
+            if not m or self.headers.get("X-Garmin") != "1":
+                return self.send_error(400)
+            if not busy.acquire(blocking=False):
+                return self.reply({"ok": False, "message": "A fetch is already running"})
+            log = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(log):
+                    set_profile(m[1])
+                    pull()
+                    parse()
+                lines = [l for l in log.getvalue().splitlines() if not l.startswith("[")]
+                self.reply({"ok": True, "message": " · ".join(lines)})
+            except SystemExit as e:
+                self.reply({"ok": False, "message": str(e)})
+            except Exception as e:
+                self.reply({"ok": False, "message": f"{type(e).__name__}: {e}"})
+            finally:
+                busy.release()
+
+    url = f"http://127.0.0.1:{port}/"
+    print(f"Dashboard at {url}  (Ctrl-C to stop)")
+    webbrowser.open(url)
+    # Threaded because browsers hold idle connections open, which stalls a single-threaded server.
+    ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
 
 
 def write_csv(path: Path, rows: list[dict], first: list[str]):
@@ -198,9 +294,9 @@ def parse():
         write_csv(DATA / "records" / f"{fit.stem}.csv", recs, ["timestamp"])
     write_csv(DATA / "runs.csv", runs, ["file", "start_time", "sub_sport", "distance_km", "pace_min_per_km", "total_timer_time", "avg_heart_rate", "longest_run_min", "walk_pct", "z2_pace_min_per_km", "hr_drift_pct"])
     write_digest(runs, top)
-    write_dashboard(runs)
+    write_dashboard(runs, top)
     write_csv(DATA / "laps.csv", laps, ["file", "lap", "start_time", "distance_km", "pace_min_per_km", "total_timer_time", "avg_heart_rate"])
-    print(f"{len(runs)} runs, {len(laps)} laps -> {DATA}/  (skipped: {skipped})")
+    print(f"{len(runs)} runs, {len(laps)} laps (skipped: {skipped})")
     if len(watches) > 1:
         print(f"WARNING: files from {len(watches)} different watches in this profile {watches}. Wrong watch pulled into it?")
 
@@ -208,21 +304,22 @@ def parse():
 def demo():
     tree = "Storage: Internal\n16 GARMIN\n  20 Sports\n    21 Run.fit\n  30 Activity\n    31 2026-05-07-08-11-04.fit\n    32 notes.txt\n  40 Workouts\n    41 w.fit\n"
     assert activity_files(tree) == {"2026-05-07-08-11-04.fit": "31"}
+    usb = '+-o Hub@1  <class IOUSBHostDevice>\n  |   "idVendor" = 1452\n  |   "USB Serial Number" = "hub1"\n+-o Watch@2  <class IOUSBHostDevice>\n  |   "USB Serial Number" = "0000aa"\n  |   "idVendor" = 2334\n'
+    assert watch_serial(usb) == "0000aa" and watch_serial(usb.replace("2334", "99")) is None
     assert add_pace({"total_distance": 5000, "total_timer_time": 1500})["pace_min_per_km"] == 5.0
     # 5 min running in zone 2 at 2.5 m/s, 1 min walking, 3 min running
     t0 = datetime(2026, 1, 1)
     rec = lambda i, cad: {"timestamp": t0 + timedelta(seconds=i), "cadence": cad, "enhanced_speed": 2.5, "heart_rate": 140}
     recs = [rec(i, 80) for i in range(300)] + [rec(i, 55) for i in range(300, 360)] + [rec(i, 80) for i in range(360, 541)]
     m = run_metrics(recs, [110, 130, 150, 170, 190])
-    assert m["longest_run_min"] == 5.0 and m["walk_pct"] == 11.1 and m["z2_pace_min_per_km"] == 6.67 and m["hr_zone_2_s"] == 540, m
+    assert m["longest_run_min"] == 5.0 and m["walk_pct"] == 11.1 and m["z2_pace_min_per_km"] == 6.67 and m["hr_zone_2_s"] == 540 and "z3_pace_min_per_km" not in m, m
 
 
 if __name__ == "__main__":
     demo()
-    if len(sys.argv) < 2 or not re.fullmatch(r"\w+", sys.argv[1]) or sys.argv[1] in ("pull", "parse"):
-        sys.exit("usage: garmin.py <profile> [pull|parse]")
-    DATA = Path(__file__).parent / "data" / sys.argv[1]
-    RAW = DATA / "raw"
+    if sys.argv[1:] == ["serve"]:
+        serve()
+    set_profile(sys.argv[1] if len(sys.argv) > 1 else "")
     cmd = sys.argv[2] if len(sys.argv) > 2 else "all"
     if cmd in ("pull", "all"):
         pull()
