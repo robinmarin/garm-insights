@@ -42,7 +42,9 @@ header { display: flex; align-items: baseline; gap: 12px; }
 dialog { color: var(--ink); background: var(--surface); border: 1px solid var(--axis); border-radius: 10px; width: min(92vw, 100ch); max-height: 88vh; padding: 16px 20px; }
 dialog::backdrop { background: rgba(0,0,0,.45); }
 dialog form { display: flex; gap: 8px; align-items: center; position: sticky; top: -16px; background: var(--surface); padding: 6px 0; }
-dialog form span { margin-right: auto; color: var(--ink2); }
+dialog form span { color: var(--ink2); }
+#cmsg { margin-right: auto; }
+#hist[hidden] { display: none; }
 dialog table { border-collapse: collapse; margin: 8px 0; }
 dialog th, dialog td { border-bottom: 1px solid var(--grid); padding: 4px 10px 4px 0; text-align: left; vertical-align: top; white-space: normal; }
 dialog p { margin: 8px 0; max-width: 80ch; }
@@ -90,7 +92,7 @@ th:first-child, td:first-child { text-align: left; padding-left: 0; }
     <label>Profile <select id="profile"></select></label>
     <input id="newp" size="14" placeholder="or new profile" aria-label="New profile name">
     <button id="fetch"></button><button id="coach">Coach</button></div></header>
-<dialog id="review"><form method="dialog"><span id="cmsg" role="status"></span><button id="ask" type="button">New review</button><button>Close</button></form><section class="box goal"><label for="goal"><b>Your goal</b><span id="gstat">Saves when you click away</span></label><textarea id="goal" rows="3" placeholder="For example: run 5K without stopping by spring. Or: a sub-20 5K, no rush."></textarea></section><div id="rtext"></div><section class="box note"><label for="answers"><b>Note for the coach</b><span>Optional</span></label><textarea id="answers" rows="4" placeholder="What the watch can't see: pain, illness, travel, or an assumption above that is wrong."></textarea><button id="send" type="button">Send note and revise the plan</button></section></dialog>
+<dialog id="review"><form method="dialog"><span id="cmsg" role="status"></span><span class="chips" id="hist" hidden><button id="older" type="button" aria-label="Older review">‹</button><span id="which"></span><button id="newer" type="button" aria-label="Newer review">›</button></span><button id="ask" type="button">New review</button><button>Close</button></form><section class="box goal"><label for="goal"><b>Your goal</b><span id="gstat">Saves when you click away</span></label><textarea id="goal" rows="3" placeholder="For example: run 5K without stopping by spring. Or: a sub-20 5K, no rush."></textarea></section><div id="rtext"></div><section class="box note"><label for="answers"><b>Note for the coach</b><span>Optional</span></label><textarea id="answers" rows="4" placeholder="What the watch can't see: pain, illness, travel, or an assumption above that is wrong."></textarea><button id="send" type="button">Send note and revise the plan</button></section></dialog>
 <section class="tiles" id="tiles"></section>
 <section class="row" style="grid-template-columns: 1fr">
   <div class="card">
@@ -286,13 +288,22 @@ if (location.protocol.startsWith("http")) {
   const md = t => esc(t).replace(/\*\*(.+?)\*\*/g, "<b>$1</b>").split("\n").map(l => l.trim()).filter(l => l && !/^\|[-| ]+\|$/.test(l))
     .map(l => l[0] === "|" ? "<tr>" + l.slice(1, -1).split("|").map(c => `<td>${c.trim()}</td>`).join("") + "</tr>" : l[0] === "#" ? `<h1>${l.replace(/^#+ /, "")}</h1>` : `<p>${l}</p>`)
     .join("").replace(/(<tr>.*?<\/tr>)+/g, "<table>$&</table>");
+  let revs = [], at = 0;  // reviews newest first, and which one is shown
+  const view = () => {
+    const r = revs[at];
+    $("rtext").innerHTML = r ? md(r.text) : "<p>No review yet. Write a goal above, then press New review to send it with this profile's runs to the coach.</p>";
+    $("hist").hidden = revs.length < 2;
+    if (r) $("which").textContent = `${r.name.slice(0, 10)} · ${at ? `${at + 1} of ${revs.length}` : "latest"}`;
+    $("older").disabled = at >= revs.length - 1; $("newer").disabled = !at;
+  };
   const show = async () => {
-    const [t, g] = await Promise.all(["coach", "goal"].map(async w => (await fetch(`/api/${w}/${me}`)).text()));
-    $("goal").value = g.trim();
-    $("rtext").innerHTML = t ? md(t) : "<p>No review yet. Write a goal above, then press New review to send it with this profile's runs to the coach.</p>";
+    const [rs, g] = await Promise.all([fetch(`/api/reviews/${me}`).then(r => r.json()), fetch(`/api/goal/${me}`).then(r => r.text())]);
+    revs = rs; at = 0; $("goal").value = g.trim(); view();
     if (!$("review").open) $("review").showModal();
   };
   $("coach").onclick = show;
+  $("older").onclick = () => { at++; view(); };
+  $("newer").onclick = () => { at--; view(); };
   const ask = async body => {
     $("ask").disabled = $("send").disabled = true; $("cmsg").textContent = "Asking the coach… a minute or two";
     try { const c = await post("coach", me, body); $("cmsg").textContent = c.ok ? "" : c.message; if (c.ok) $("answers").value = ""; await show(); }
