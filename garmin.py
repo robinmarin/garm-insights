@@ -17,7 +17,7 @@ import csv
 import json
 import re
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import subprocess
 import sys
 import zlib
@@ -31,8 +31,8 @@ DATA = RAW = None  # set by set_profile()
 
 def set_profile(name: str):
     global DATA, RAW
-    if not re.fullmatch(r"\w+", name) or name in ("pull", "parse", "serve", "coach", "workouts"):
-        sys.exit("usage: garmin.py <profile> [pull|parse|coach|workouts]  |  garmin.py serve")
+    if not re.fullmatch(r"\w+", name) or name in ("pull", "parse", "serve", "coach", "workouts", "wipe"):
+        sys.exit("usage: garmin.py <profile> [pull|parse|coach|workouts|wipe]  |  garmin.py serve")
     DATA = ROOT / "data" / name
     RAW = DATA / "raw"
 
@@ -50,8 +50,8 @@ SEMI = 180 / 2**31  # FIT stores lat/long in semicircles
 WALK_CADENCE = 65  # strides/min (one foot), so 130 steps/min. Below this counts as walking; tune per runner.
 
 
-def activity_files(tree: str) -> dict[str, str]:
-    """Parse `mtp-filetree` output -> {filename: object_id} for the Activity folder."""
+def folder_files(tree: str, folder: str) -> dict[str, str]:
+    """Parse `mtp-filetree` output -> {filename: object_id} for the .fit files in GARMIN/<folder>."""
     out, inside = {}, False
     for line in tree.splitlines():
         m = re.match(r"^( *)(\d+) (.+)$", line)
@@ -59,7 +59,7 @@ def activity_files(tree: str) -> dict[str, str]:
             continue
         indent, oid, name = len(m[1]), m[2], m[3]
         if indent == 2:
-            inside = name == "Activity"
+            inside = name == folder
         elif inside and indent == 4 and name.lower().endswith(".fit"):
             out[name] = oid
     return out
@@ -76,7 +76,7 @@ def check_watch() -> str | None:
 def pull():
     serial, known = check_watch(), DATA / "watch.txt"
     tree = subprocess.run(["mtp-filetree"], capture_output=True, text=True).stdout
-    files = activity_files(tree)
+    files = folder_files(tree, "Activity")
     if not files:
         sys.exit("No activity files found. Is the watch plugged in and unlocked? (Close Garmin Express / Android File Transfer.)")
     RAW.mkdir(parents=True, exist_ok=True)
@@ -244,7 +244,7 @@ def serve(port=8765):
             self.reply(f.read_text() if f.exists() else render([], m[1]), "text/html; charset=utf-8")
 
         def do_POST(self):
-            m = re.fullmatch(r"/api/(pull|coach|goal)/(\w+)", self.path)
+            m = re.fullmatch(r"/api/(pull|coach|goal|workouts|wipe)/(\w+)", self.path)
             # The custom header can't be sent cross-site without a CORS preflight, so other web pages can't trigger a pull.
             if not m or self.headers.get("X-Garmin") != "1":
                 return self.send_error(400)
@@ -261,11 +261,16 @@ def serve(port=8765):
                     set_profile(m[2])
                     if m[1] == "coach":
                         coach(body)
+                    elif m[1] == "workouts":
+                        workouts()
+                    elif m[1] == "wipe":
+                        wipe()
                     else:
                         pull()
                         parse()
                 lines = [l for l in log.getvalue().splitlines() if not l.startswith("[")]
-                self.reply({"ok": True, "message": "Review ready" if m[1] == "coach" else " · ".join(lines)})
+                done = {"coach": "Review ready", "workouts": lines[-1] if lines else "", "wipe": lines[-1] if lines else ""}
+                self.reply({"ok": True, "message": done.get(m[1], " · ".join(lines))})
             except SystemExit as e:
                 self.reply({"ok": False, "message": str(e)})
             except Exception as e:
@@ -319,23 +324,67 @@ def coach(note=""):
     print(text, f"\n\nSaved to {DATA / 'coach.md'}")
 
 
-WORKOUT_PROMPT = """Turn the two-week plan in the coach review below into structured workouts for a Garmin watch.
+# One step in the coach table's Watch column: "3x(" opens a repeat, ")" closes it, "5 run 120-132" or "5 walk <155" is a timed step.
+WATCH_TOKEN = re.compile(r"(\d+)x\(|(\d+(?:\.\d+)?) (walk|run)(?: (\d+)-(\d+)| <(\d+))?|\)")
 
-Answer with only a JSON array, no prose and no code fence. One object per running session; leave out rest days.
-Each object: {"date": "YYYY-MM-DD", "name": "<short, max 15 chars, e.g. Run 6x2 or Easy RW 30>", "steps": [...]}.
-A step is either {"min": <minutes>, "kind": "warmup|active|recovery|cooldown", "hr": [<low bpm>, <high bpm>]}
-or a repeat block {"repeat": <total times>, "steps": [<steps>]}.
-"hr" is optional, and the watch alarms whenever the runner leaves the range, so only use it where the plan wants an alert.
-A range the runner should "aim for" while walking by the clock is guidance, not a target: leave "hr" out,
-or if the plan gives an alert ceiling for that session, use [90, <ceiling>] so only going too high alarms. Never put "hr" on walk steps.
-Leave out "min" only for a step that should last until the runner presses lap.
-A run/walk session steered by a heart rate alert (walk when it beeps) is one active step for the full duration with that hr range.
-Walk breaks inside a run are "recovery". Use the dates in the plan table; the year is the one in the review title.
-"""
+
+def watch_steps(text: str) -> list[dict]:
+    """'5 walk, 3x(5 run <155, 2 walk), 4 walk' -> workout_fit steps. Format defined in coach_prompt.md."""
+    if re.sub(r"[\s,]", "", WATCH_TOKEN.sub("", text)):
+        raise ValueError(f"can't read {text!r}")
+    stack = [[]]
+    for m in WATCH_TOKEN.finditer(text):
+        if m[1]:
+            block = {"repeat": int(m[1]), "steps": []}
+            stack[-1].append(block)
+            stack.append(block["steps"])
+        elif m[2]:
+            st = {"min": float(m[2]), "kind": "active" if m[3] == "run" else "recovery"}
+            if m[4]:
+                st["hr"] = [int(m[4]), int(m[5])]
+            elif m[6]:  # ceiling only; 90 is a floor no runner drops below, so the low alarm never fires
+                st["hr"] = [90, int(m[6])]
+            stack[-1].append(st)
+        elif len(stack) > 1:
+            stack.pop()
+        else:
+            raise ValueError(f"unmatched ')' in {text!r}")
+    steps = stack[0]
+    if len(stack) > 1 or not steps:
+        raise ValueError(f"can't read {text!r}")
+    for i, kind in ((0, "warmup"), (-1, "cooldown")):  # a walk at either end is the warm-up or cool-down
+        if steps[i].get("kind") == "recovery":
+            steps[i]["kind"] = kind
+    return steps
+
+
+def plan_workouts(review: str) -> list[dict]:
+    """The coach review's plan table (the one with a Watch column) -> [{"date", "name", "steps"}], rest days left out."""
+    lines = [l.strip() for l in review.splitlines()]
+    start = next((i for i, l in enumerate(lines) if l.startswith("|") and "Watch" in l), None)
+    if start is None:
+        raise ValueError("the review has no plan table with a Watch column")
+    row = lambda l: [c.strip() for c in l.strip("|").split("|")]
+    head = row(lines[start])
+    d, n, w = head.index("Date"), head.index("Session"), head.index("Watch")
+    plan = []
+    for l in lines[start + 1:]:
+        if not l.startswith("|"):
+            break
+        r = row(l)
+        steps = r[w].strip("` ") if len(r) == len(head) else ""
+        if not steps or set(r[0]) <= set("-: "):  # rest day or the |---| line
+            continue
+        date = re.search(r"\d{4}-\d\d-\d\d", r[d])
+        if not date:
+            raise ValueError(f"no YYYY-MM-DD date in {r[d]!r}")
+        y, mo, dd = date[0].split("-")
+        plan.append({"date": date[0], "name": f"{mo}-{dd}-{y[2:]} {r[n]}"[:24], "steps": watch_steps(steps)})
+    return plan
 
 
 def workout_fit(w: dict) -> bytes:
-    """{"name", "steps"} -> a FIT workout file. Step format as in WORKOUT_PROMPT."""
+    """{"name", "steps"} -> a FIT workout file. A step is {"min", "kind", "hr": [lo, hi]} or {"repeat": n, "steps": [...]}."""
     from garmin_fit_sdk import Encoder
 
     rows = []
@@ -365,68 +414,142 @@ def workout_fit(w: dict) -> bytes:
     return e.close()
 
 
-def mtp_send(folder_id: int, paths: list[Path]) -> list[str]:
-    """Copy files into a watch folder through libmtp; returns the names that failed.
+class Watch:
+    """One libmtp session with the plugged-in watch: find folders, send, list and delete by object id.
 
-    mtp-sendfile can't do this on Garmins: it finds the folder but not its storage, so the device rejects the upload.
+    A Garmin renumbers its objects on every new MTP session, so ids from mtp-filetree or an earlier session can point
+    at a different file. Look ids up and use them inside the same `with Watch()` block, never across two.
+    mtp-sendfile is no help either: it finds the folder but not its storage, so the device rejects the upload.
     """
-    import ctypes as C
+    ROOT = 0xFFFFFFFF
 
-    class F(C.Structure):  # LIBMTP_file_t
-        pass
-    F._fields_ = [("item_id", C.c_uint32), ("parent_id", C.c_uint32), ("storage_id", C.c_uint32), ("filename", C.c_char_p),
-                  ("filesize", C.c_uint64), ("modificationdate", C.c_long), ("filetype", C.c_int), ("next", C.POINTER(F))]
-    lib = C.CDLL("/opt/homebrew/lib/libmtp.dylib")
-    lib.LIBMTP_Get_First_Device.restype = C.c_void_p
-    lib.LIBMTP_Get_Filemetadata.restype = C.POINTER(F)
-    lib.LIBMTP_Get_Filemetadata.argtypes = [C.c_void_p, C.c_uint32]
-    lib.LIBMTP_Send_File_From_File.argtypes = [C.c_void_p, C.c_char_p, C.POINTER(F), C.c_void_p, C.c_void_p]
-    lib.LIBMTP_Release_Device.argtypes = [C.c_void_p]
-    lib.LIBMTP_Init()
-    dev = lib.LIBMTP_Get_First_Device()
-    if not dev:
-        sys.exit("Could not open the watch over MTP. Close Garmin Express / Android File Transfer and try again.")
-    try:
-        folder = lib.LIBMTP_Get_Filemetadata(dev, folder_id)
-        if not folder:
-            sys.exit(f"Could not read folder {folder_id} on the watch.")
+    def __enter__(self):
+        import ctypes as C
+
+        class F(C.Structure):  # LIBMTP_file_t
+            pass
+        F._fields_ = [("item_id", C.c_uint32), ("parent_id", C.c_uint32), ("storage_id", C.c_uint32), ("filename", C.c_char_p),
+                      ("filesize", C.c_uint64), ("modificationdate", C.c_long), ("filetype", C.c_int), ("next", C.POINTER(F))]
+
+        class Storage(C.Structure):  # LIBMTP_devicestorage_t, only the id we need
+            _fields_ = [("id", C.c_uint32)]
+
+        class Device(C.Structure):  # LIBMTP_mtpdevice_t, up to the storage list
+            _fields_ = [("object_bitsize", C.c_uint8), ("params", C.c_void_p), ("usbinfo", C.c_void_p), ("storage", C.POINTER(Storage))]
+
+        lib = C.CDLL("/opt/homebrew/lib/libmtp.dylib")
+        lib.LIBMTP_Open_Raw_Device_Uncached.restype = C.POINTER(Device)
+        lib.LIBMTP_Open_Raw_Device_Uncached.argtypes = [C.c_void_p]
+        lib.LIBMTP_Get_Files_And_Folders.restype = C.POINTER(F)
+        lib.LIBMTP_Get_Files_And_Folders.argtypes = [C.POINTER(Device), C.c_uint32, C.c_uint32]
+        lib.LIBMTP_destroy_file_t.argtypes = [C.POINTER(F)]
+        lib.LIBMTP_Send_File_From_File.argtypes = [C.POINTER(Device), C.c_char_p, C.POINTER(F), C.c_void_p, C.c_void_p]
+        lib.LIBMTP_Delete_Object.argtypes = [C.POINTER(Device), C.c_uint32]
+        lib.LIBMTP_Release_Device.argtypes = [C.POINTER(Device)]
+        lib.LIBMTP_Init()
+        raw, n = C.c_void_p(), C.c_int()
+        # Uncached, because a cached device refuses to list one folder at a time.
+        self.dev = lib.LIBMTP_Open_Raw_Device_Uncached(raw) if not lib.LIBMTP_Detect_Raw_Devices(C.byref(raw), C.byref(n)) and n.value else None
+        if not self.dev or not self.dev.contents.storage:
+            sys.exit("Could not open the watch over MTP. Unlock it, close Garmin Express / Android File Transfer, and try again.")
+        self.C, self.F, self.lib, self.storage = C, F, lib, self.dev.contents.storage.contents.id
+        return self
+
+    def __exit__(self, *exc):
+        self.lib.LIBMTP_Release_Device(self.dev)
+
+    def ls(self, folder: int) -> dict[str, int]:
+        """{name: object_id} of everything directly inside a folder."""
+        out, f = {}, self.lib.LIBMTP_Get_Files_And_Folders(self.dev, self.storage, folder)
+        while f:
+            out[f.contents.filename.decode()] = f.contents.item_id
+            nxt = f.contents.next
+            self.lib.LIBMTP_destroy_file_t(f)
+            f = nxt
+        return out
+
+    def folder(self, name: str) -> int:
+        """Object id of GARMIN/<name>."""
+        garmin = self.ls(self.ROOT).get("GARMIN")
+        found = self.ls(garmin).get(name) if garmin else None
+        if not found:
+            sys.exit(f"No GARMIN/{name} folder on the watch.")
+        return found
+
+    def send(self, folder: int, paths: list[Path]) -> list[str]:
+        """Copy files into a folder; returns the names that failed."""
         failed = []
         for path in paths:
-            f = F(parent_id=folder_id, storage_id=folder.contents.storage_id, filename=path.name.encode(),
-                  filesize=path.stat().st_size, filetype=44)  # 44 = LIBMTP_FILETYPE_UNKNOWN
-            if lib.LIBMTP_Send_File_From_File(dev, str(path).encode(), C.byref(f), None, None):
+            f = self.F(parent_id=folder, storage_id=self.storage, filename=path.name.encode(),
+                       filesize=path.stat().st_size, filetype=44)  # 44 = LIBMTP_FILETYPE_UNKNOWN
+            if self.lib.LIBMTP_Send_File_From_File(self.dev, str(path).encode(), self.C.byref(f), None, None):
                 failed.append(path.name)
         return failed
-    finally:
-        lib.LIBMTP_Release_Device(dev)
+
+    def delete(self, ids: list[int]) -> int:
+        """Delete objects found in this session; returns how many went."""
+        return sum(self.lib.LIBMTP_Delete_Object(self.dev, oid) == 0 for oid in ids)
+
+
+# What the watch names a workout this script pushed: 'MM-DD-YY_<name>_workout.fit', with _01, _02... on re-import.
+# Pushes before the year was added are 'MM-DD_...'. Garmin's own workouts don't start with a date.
+PLANNED = re.compile(r"(\d\d)-(\d\d)(?:-(\d\d))?_.*_workout(?:_\d+)?\.fit$", re.I)
+PENDING = re.compile(r"\d{4}-\d\d-\d\d\.fit")  # our files still waiting in NewFiles
+
+
+def planned_workouts(on_watch: dict[str, int], today: date) -> dict[int, date]:
+    """{filename: object_id} from GARMIN/Workouts -> {object_id: day} for the workouts this script put there."""
+    out = {}
+    for name, oid in on_watch.items():
+        m = PLANNED.match(name)
+        if m:
+            try:
+                out[oid] = date(2000 + int(m[3]) if m[3] else today.year, int(m[1]), int(m[2]))
+            except ValueError:  # 02-29 without a year
+                pass
+    return out
+
+
+def wipe():
+    """Remove every workout this script put on the watch, including ones still waiting in NewFiles. Garmin's own stay."""
+    if not check_watch():
+        sys.exit("No Garmin watch found over USB. Plug it in and unlock it.")
+    with Watch() as w:
+        ids = list(planned_workouts(w.ls(w.folder("Workouts")), date.today()))
+        ids += [oid for name, oid in w.ls(w.folder("NewFiles")).items() if PENDING.fullmatch(name)]
+        print(f"{w.delete(ids)} of {len(ids)} planned workouts removed from the watch.")
 
 
 def workouts():
     """Turn the latest coach plan into workout files and copy them onto the watch (Training > Workouts)."""
     if not (DATA / "coach.md").exists():
         sys.exit(f"No coach review for '{DATA.name}' yet. Run: garmin.py {DATA.name} coach")
-    serial = check_watch()
-    if not serial:
-        sys.exit("No Garmin watch found over USB. Plug it in and unlock it.")
-    answer = ask_claude(WORKOUT_PROMPT + "\n\n" + (DATA / "coach.md").read_text(), DATA / "workouts_request.md")
-    plan = json.loads(re.sub(r"\A```\w*\n|\n```\Z", "", answer))
+    try:
+        plan = plan_workouts((DATA / "coach.md").read_text())
+    except ValueError as e:
+        sys.exit(f"Can't turn the latest review into workouts ({e}). Ask for a new review and push again.")
     plan = [w for w in plan if w["date"] >= f"{datetime.now():%Y-%m-%d}"]
-    folder = re.search(r"(?m)^  (\d+) NewFiles$", subprocess.run(["mtp-filetree"], capture_output=True, text=True).stdout)
-    if not folder:
-        sys.exit("No GARMIN/NewFiles folder on the watch. Is it unlocked? (Close Garmin Express / Android File Transfer.)")
+    if not plan:
+        sys.exit("The latest review has no sessions from today on. Ask for a new review.")
+    if not check_watch():
+        sys.exit("No Garmin watch found over USB. Plug it in and unlock it.")
     out = DATA / "workouts"
     out.mkdir(exist_ok=True)
     (out / "plan.json").write_text(json.dumps(plan, indent=1))
     files = []
-    for w in plan:
-        w["name"] = f"{w['date'][5:]} {w['name']}"[:21]  # date first so the watch list sorts and shows which day
+    for w in plan:  # names start with the date, so the watch list sorts and shows which day
         files.append(out / f"{w['date']}.fit")
         files[-1].write_bytes(workout_fit(w))
         print(w["name"])
-    missing = mtp_send(int(folder[1]), files)  # the watch imports anything in NewFiles when it is unplugged
-    if missing:
-        sys.exit(f"Not on the watch: {missing}. Files are in {out}; copy them to GARMIN/NewFiles by hand.")
-    print(f"{len(files)} workouts copied. Unplug the watch to import them, then find them under Training > Workouts.")
+    with Watch() as watch:
+        missing = watch.send(watch.folder("NewFiles"), files)  # the watch imports anything in NewFiles when it is unplugged
+        if missing:
+            sys.exit(f"Not on the watch: {missing}. Files are in {out}; copy them to GARMIN/NewFiles by hand.")
+        # Only once the new ones are safely in NewFiles: drop past days, and old versions of days the new plan replaces.
+        today, new_days = date.today(), {date.fromisoformat(w["date"]) for w in plan}
+        old = [oid for oid, d in planned_workouts(watch.ls(watch.folder("Workouts")), today).items() if d < today or d in new_days]
+        removed = watch.delete(old)
+    print(f"{len(files)} workouts copied, {removed} old ones removed. Unplug the watch to import them, then find them under Training > Workouts.")
 
 
 def write_csv(path: Path, rows: list[dict], first: list[str]):
@@ -478,7 +601,10 @@ def parse():
 
 def demo():
     tree = "Storage: Internal\n16 GARMIN\n  20 Sports\n    21 Run.fit\n  30 Activity\n    31 2026-05-07-08-11-04.fit\n    32 notes.txt\n  40 Workouts\n    41 w.fit\n"
-    assert activity_files(tree) == {"2026-05-07-08-11-04.fit": "31"}
+    assert folder_files(tree, "Activity") == {"2026-05-07-08-11-04.fit": "31"}
+    on_watch = {"01-04-27_Run_3x5_workout_01.fit": 1, "01-07-27_Run_3x6_workout.fit": 2, "12-30-26_Easy_workout.fit": 3,
+                "11-14_Run_3x5_workout.fit": 4, "Sun_Salutations_workout.fit": 5, "COHRNCE.FIT": 6}
+    assert planned_workouts(on_watch, date(2026, 11, 12)) == {1: date(2027, 1, 4), 2: date(2027, 1, 7), 3: date(2026, 12, 30), 4: date(2026, 11, 14)}
     usb = '+-o Hub@1  <class IOUSBHostDevice>\n  |   "idVendor" = 1452\n  |   "USB Serial Number" = "hub1"\n+-o Watch@2  <class IOUSBHostDevice>\n  |   "USB Serial Number" = "0000aa"\n  |   "idVendor" = 2334\n'
     assert watch_serial(usb) == "0000aa" and watch_serial(usb.replace("2334", "99")) is None
     assert add_pace({"total_distance": 5000, "total_timer_time": 1500})["pace_min_per_km"] == 5.0
@@ -497,6 +623,26 @@ def demo():
     assert st[4]["duration_type"] == "open" and st[4]["intensity"] == "cooldown"
     ids = {Decoder(Stream.from_byte_array(bytearray(workout_fit({**w, "name": n})))).read()[0]["file_id_mesgs"][0]["serial_number"] for n in ("a", "b")}
     assert len(ids) == 2, "workouts written together must not share a file_id"
+    review = """**The next two weeks.**
+
+| Date | Session | Watch | How to run it | What it is for |
+|---|---|---|---|---|
+| Fri 2026-11-13 | Rest | | | |
+| Sat 2026-11-14 | Run 3x5 | `5 walk, 3x(5 run <155, 2 walk), 4 walk` | Aim for 140 to 150 bpm | Longer runs |
+| Sun 2026-11-15 | Easy RW 30 | 30 run 120-132 | Walk when it beeps | Easy volume |
+
+| other | table |"""
+    plan = plan_workouts(review)
+    assert [(w["date"], w["name"]) for w in plan] == [("2026-11-14", "11-14-26 Run 3x5"), ("2026-11-15", "11-15-26 Easy RW 30")], plan
+    assert plan[0]["steps"] == [{"min": 5, "kind": "warmup"}, {"repeat": 3, "steps": [{"min": 5, "kind": "active", "hr": [90, 155]}, {"min": 2, "kind": "recovery"}]},
+                                {"min": 4, "kind": "cooldown"}], plan[0]
+    assert plan[1]["steps"] == [{"min": 30, "kind": "active", "hr": [120, 132]}]
+    for bad in ("5 jog", "3x(5 run", "5 run), 2 walk", "", "5 run 120"):
+        try:
+            watch_steps(bad)
+            raise AssertionError(bad)
+        except ValueError:
+            pass
     assert m["longest_run_min"] == 5.0 and m["walk_pct"] == 11.1 and m["z2_pace_min_per_km"] == 6.67 and m["hr_zone_2_s"] == 540 and "z3_pace_min_per_km" not in m, m
 
 
@@ -510,6 +656,8 @@ if __name__ == "__main__":
         coach(" ".join(sys.argv[3:]))  # garmin.py robin coach "optional note, e.g. sore calf"
     if cmd == "workouts":
         workouts()
+    if cmd == "wipe":
+        wipe()
     if cmd in ("pull", "all"):
         pull()
     if cmd in ("parse", "all"):
