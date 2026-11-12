@@ -41,6 +41,7 @@ Plug in the watch, unlock it, and quit Garmin Express or Android File Transfer i
 .venv/bin/python garmin.py robin pull     # only copy new files
 .venv/bin/python garmin.py robin parse    # only rebuild from files already copied
 .venv/bin/python garmin.py robin coach    # ask Claude for a review
+.venv/bin/python garmin.py robin workouts # put the review's plan on the watch
 .venv/bin/python garmin.py serve          # open the dashboard at http://127.0.0.1:8765
 ```
 
@@ -59,6 +60,8 @@ Write your goal in `data/<profile>/goal.txt` or on the dashboard. To tell the co
 ```
 
 Notes are kept in `notes.md` and included in every later review. The full prompt is saved to `coach_request.md` each time, so you can paste it into another model if you'd rather.
+
+`workouts` puts the two-week plan from the latest review on the watch. Claude converts the plan table into timed steps, one FIT file per session goes into `workouts/`, and the files are copied to the watch. Unplug it to import them, then start one from Training > Workouts. Names start with the date, like `11-14 Run 3x5`, and rest days are skipped. The watch alerts whenever you leave a step's heart rate range, so a step only gets one when the plan wants an alert. A range you're told to aim for while walking by the clock becomes a ceiling, not an alarm on both sides.
 
 The review runs on Sonnet by default. Change `COACH_MODEL` at the top of `garmin.py` to `"opus"` if Sonnet's reviews fall short.
 

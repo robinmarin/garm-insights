@@ -6,13 +6,14 @@ Pulls run FIT files off a Garmin watch over USB (MTP), flattens them to CSV, bui
 
 ## Commands
 
-Setup: `brew install libmtp` (provides `mtp-filetree`, `mtp-getfile`), then `.venv/bin/pip install -r requirements.txt`.
+Setup: `brew install libmtp` (provides `mtp-filetree`, `mtp-getfile`, and `libmtp.dylib`, which `mtp_send()` loads via ctypes), then `.venv/bin/pip install -r requirements.txt`.
 
 ```
 .venv/bin/python garmin.py <profile>          # pull + parse into data/<profile>/
 .venv/bin/python garmin.py <profile> pull     # watch -> data/<profile>/raw/*.fit, new files only
 .venv/bin/python garmin.py <profile> parse    # raw -> runs.csv, laps.csv, records/*.csv, digest.md, dashboard.html
 .venv/bin/python garmin.py <profile> coach "optional note"   # review -> data/<profile>/coach.md
+.venv/bin/python garmin.py <profile> workouts  # coach.md plan -> workout FIT files -> watch GARMIN/NewFiles
 .venv/bin/python garmin.py serve              # dashboard on http://127.0.0.1:8765
 ```
 
@@ -24,7 +25,7 @@ There is no test suite or linter. `demo()` at the bottom of `garmin.py` holds as
 
 Everything is in `garmin.py`. `dashboard.html` is a template, not a page: `render()` substitutes the literal markers `/*DATA*/[]`, `/*ZONES*/[]` and `/*NAME*/` and writes the result to `data/<profile>/dashboard.html`. Keep those markers intact when editing the template. The page renders fine with empty data, which `serve` relies on for a profile with no runs yet.
 
-`data/` is gitignored and holds personal data. Per profile it contains `raw/`, the CSVs, `digest.md`, `dashboard.html`, `watch.txt` (serial of the watch first pulled into it), `goal.txt`, `notes.md` (runner notes appended on each coach call), `coach.md` (last review, the one fed into the next prompt), `coach/<YYYY-MM-DD-HHMMSS>.md` (every review, browsable in the dashboard) and `coach_request.md` (the full prompt last sent).
+`data/` is gitignored and holds personal data. Per profile it contains `raw/`, the CSVs, `digest.md`, `dashboard.html`, `watch.txt` (serial of the watch first pulled into it), `goal.txt`, `notes.md` (runner notes appended on each coach call), `coach.md` (last review, the one fed into the next prompt), `coach/<YYYY-MM-DD-HHMMSS>.md` (every review, browsable in the dashboard), `coach_request.md` (the full prompt last sent), `workouts/` (the plan as `plan.json` plus one `<date>.fit` per session) and `workouts_request.md`.
 
 ## Things that span several functions
 
@@ -33,4 +34,5 @@ Everything is in `garmin.py`. `dashboard.html` is a template, not a page: `rende
 - **Walking is cadence-based.** `WALK_CADENCE` (strides/min, one foot) splits walking from running. Walk %, longest unbroken run, zone paces and drift all depend on it.
 - **Wrong-watch guards.** `pull()` refuses to pull if the connected watch serial differs from `watch.txt`; `parse()` warns if the raw files come from more than one watch.
 - **Coach review** shells out to the logged-in `claude` CLI (`claude -p --model $COACH_MODEL`), not the API. The prompt is `coach_prompt.md` plus today's date, goal, notes, the previous review and the digest. Changing the digest's columns means checking that `coach_prompt.md` still describes them correctly.
+- **Workouts** (`workouts`): a second `claude` call turns `coach.md`'s two-week table into JSON (format in `WORKOUT_PROMPT`), `workout_fit()` encodes it with the SDK's `Encoder`, and `mtp_send()` copies each file to `GARMIN/NewFiles` by calling libmtp through ctypes (`mtp-sendfile` fails on Garmins: it cannot resolve the folder's storage). The watch imports them when unplugged. Custom HR targets are stored as bpm + 100. If the coach prompt's plan section changes shape, check `WORKOUT_PROMPT` still fits.
 - **Server API** (`serve`): `GET /api/profiles`, `GET /api/goal/<p>`, `GET /api/reviews/<p>` (all reviews, newest first), `POST /api/{pull,coach,goal}/<p>`. POSTs require the header `X-Garmin: 1` as a CSRF guard; the dashboard's JS sends it. It binds to 127.0.0.1 only.

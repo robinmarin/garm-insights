@@ -20,6 +20,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 import subprocess
 import sys
+import zlib
 from pathlib import Path
 
 COACH_MODEL = "sonnet"  # model alias for the coach review; "opus" if Sonnet's reviews fall short
@@ -30,8 +31,8 @@ DATA = RAW = None  # set by set_profile()
 
 def set_profile(name: str):
     global DATA, RAW
-    if not re.fullmatch(r"\w+", name) or name in ("pull", "parse", "serve", "coach"):
-        sys.exit("usage: garmin.py <profile> [pull|parse|coach]  |  garmin.py serve")
+    if not re.fullmatch(r"\w+", name) or name in ("pull", "parse", "serve", "coach", "workouts"):
+        sys.exit("usage: garmin.py <profile> [pull|parse|coach|workouts]  |  garmin.py serve")
     DATA = ROOT / "data" / name
     RAW = DATA / "raw"
 
@@ -64,11 +65,16 @@ def activity_files(tree: str) -> dict[str, str]:
     return out
 
 
-def pull():
-    # Each profile remembers its watch, so plugging in the other person's can't mix two people's runs.
+def check_watch() -> str | None:
+    """Each profile remembers its watch, so plugging in the other person's can't mix two people's runs or plans."""
     serial, known = watch_serial(), DATA / "watch.txt"
     if serial and known.exists() and known.read_text().strip() != serial:
         sys.exit(f"The connected watch ({serial}) is not the one profile '{DATA.name}' was pulled from before. Pick the right profile.")
+    return serial
+
+
+def pull():
+    serial, known = check_watch(), DATA / "watch.txt"
     tree = subprocess.run(["mtp-filetree"], capture_output=True, text=True).stdout
     files = activity_files(tree)
     if not files:
@@ -274,6 +280,19 @@ def serve(port=8765):
     ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
 
 
+def ask_claude(prompt: str, sent: Path) -> str:
+    """Send prompt to the logged-in claude CLI; the prompt is saved to `sent` so it can be pasted elsewhere."""
+    sent.write_text(prompt + "\n")
+    try:
+        # ponytail: uses the logged-in claude CLI, so no API key or SDK. Swap for the anthropic SDK if this runs unattended.
+        out = subprocess.run(["claude", "-p", "--model", COACH_MODEL], input=prompt, capture_output=True, text=True, timeout=900, cwd=DATA)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        sys.exit(f"Could not reach Claude ({e}). The prompt is in {sent}.")
+    if out.returncode or not out.stdout.strip():
+        sys.exit(f"Claude failed: {out.stderr.strip() or 'empty answer'}. The prompt is in {sent}.")
+    return out.stdout.strip()
+
+
 def coach(note=""):
     """Wrap goal, the runner's notes, last review and digest in the coach prompt, send it to Claude, save the answer."""
     def part(title, path, missing):
@@ -291,22 +310,123 @@ def coach(note=""):
               + part("The runner's notes, oldest first", DATA / "notes.md", "None yet.")
               + part("Your previous review", DATA / "coach.md", "None. This is the first review.")
               + part("Training log", DATA / "digest.md", ""))
-    sent = DATA / "coach_request.md"  # the full wrapped prompt; paste it into any other LLM if you prefer
-    sent.write_text(prompt + "\n")
-    try:
-        # ponytail: uses the logged-in claude CLI, so no API key or SDK. Swap for the anthropic SDK if this runs unattended.
-        out = subprocess.run(["claude", "-p", "--model", COACH_MODEL], input=prompt, capture_output=True, text=True, timeout=900, cwd=DATA)
-    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        sys.exit(f"Could not reach Claude ({e}). The prompt is in {sent}.")
-    if out.returncode or not out.stdout.strip():
-        sys.exit(f"Claude failed: {out.stderr.strip() or 'empty answer'}. The prompt is in {sent}.")
-    text = re.sub(r"\A#[^\n]*\n+", "", out.stdout.strip())  # it sometimes repeats the previous review's title
+    text = re.sub(r"\A#[^\n]*\n+", "", ask_claude(prompt, DATA / "coach_request.md"))  # it sometimes repeats the previous review's title
     now = datetime.now()
     review = f"# Coach review: {DATA.name}, {now:%Y-%m-%d}\n\n{text}\n"
     (DATA / "coach.md").write_text(review)  # the latest, which the next prompt includes
     (DATA / "coach").mkdir(exist_ok=True)
     (DATA / "coach" / f"{now:%Y-%m-%d-%H%M%S}.md").write_text(review)  # every review, for the dashboard's history
     print(text, f"\n\nSaved to {DATA / 'coach.md'}")
+
+
+WORKOUT_PROMPT = """Turn the two-week plan in the coach review below into structured workouts for a Garmin watch.
+
+Answer with only a JSON array, no prose and no code fence. One object per running session; leave out rest days.
+Each object: {"date": "YYYY-MM-DD", "name": "<short, max 15 chars, e.g. Run 6x2 or Easy RW 30>", "steps": [...]}.
+A step is either {"min": <minutes>, "kind": "warmup|active|recovery|cooldown", "hr": [<low bpm>, <high bpm>]}
+or a repeat block {"repeat": <total times>, "steps": [<steps>]}.
+"hr" is optional, and the watch alarms whenever the runner leaves the range, so only use it where the plan wants an alert.
+A range the runner should "aim for" while walking by the clock is guidance, not a target: leave "hr" out,
+or if the plan gives an alert ceiling for that session, use [90, <ceiling>] so only going too high alarms. Never put "hr" on walk steps.
+Leave out "min" only for a step that should last until the runner presses lap.
+A run/walk session steered by a heart rate alert (walk when it beeps) is one active step for the full duration with that hr range.
+Walk breaks inside a run are "recovery". Use the dates in the plan table; the year is the one in the review title.
+"""
+
+
+def workout_fit(w: dict) -> bytes:
+    """{"name", "steps"} -> a FIT workout file. Step format as in WORKOUT_PROMPT."""
+    from garmin_fit_sdk import Encoder
+
+    rows = []
+
+    def add(steps):
+        for st in steps:
+            if "repeat" in st:  # inner steps, then a step that jumps back to the first of them
+                first = len(rows)
+                add(st["steps"])
+                rows.append({"duration_type": "repeat_until_steps_cmplt", "duration_value": first, "target_value": int(st["repeat"])})
+                continue
+            row = {"intensity": st.get("kind", "active"), "target_type": "open"}
+            row.update({"duration_type": "time", "duration_value": round(st["min"] * 60000)} if st.get("min") else {"duration_type": "open"})
+            if st.get("hr"):  # custom HR targets are stored as bpm + 100; 1-100 would mean % of max
+                lo, hi = st["hr"]
+                row.update(target_type="heart_rate", target_value=0, custom_target_value_low=int(lo) + 100, custom_target_value_high=int(hi) + 100)
+            rows.append(row)
+
+    add(w["steps"])
+    e = Encoder()
+    # The watch treats files with the same file_id as one file and imports only one of them, so each workout needs its own serial.
+    serial = zlib.crc32(w["name"].encode()) or 1
+    e.write_mesg({"mesg_num": 0, "type": "workout", "manufacturer": "development", "product": 0, "serial_number": serial, "time_created": datetime.now()})
+    e.write_mesg({"mesg_num": 26, "sport": "running", "num_valid_steps": len(rows), "wkt_name": w["name"]})
+    for i, row in enumerate(rows):
+        e.write_mesg({"mesg_num": 27, "message_index": i, **row})
+    return e.close()
+
+
+def mtp_send(folder_id: int, paths: list[Path]) -> list[str]:
+    """Copy files into a watch folder through libmtp; returns the names that failed.
+
+    mtp-sendfile can't do this on Garmins: it finds the folder but not its storage, so the device rejects the upload.
+    """
+    import ctypes as C
+
+    class F(C.Structure):  # LIBMTP_file_t
+        pass
+    F._fields_ = [("item_id", C.c_uint32), ("parent_id", C.c_uint32), ("storage_id", C.c_uint32), ("filename", C.c_char_p),
+                  ("filesize", C.c_uint64), ("modificationdate", C.c_long), ("filetype", C.c_int), ("next", C.POINTER(F))]
+    lib = C.CDLL("/opt/homebrew/lib/libmtp.dylib")
+    lib.LIBMTP_Get_First_Device.restype = C.c_void_p
+    lib.LIBMTP_Get_Filemetadata.restype = C.POINTER(F)
+    lib.LIBMTP_Get_Filemetadata.argtypes = [C.c_void_p, C.c_uint32]
+    lib.LIBMTP_Send_File_From_File.argtypes = [C.c_void_p, C.c_char_p, C.POINTER(F), C.c_void_p, C.c_void_p]
+    lib.LIBMTP_Release_Device.argtypes = [C.c_void_p]
+    lib.LIBMTP_Init()
+    dev = lib.LIBMTP_Get_First_Device()
+    if not dev:
+        sys.exit("Could not open the watch over MTP. Close Garmin Express / Android File Transfer and try again.")
+    try:
+        folder = lib.LIBMTP_Get_Filemetadata(dev, folder_id)
+        if not folder:
+            sys.exit(f"Could not read folder {folder_id} on the watch.")
+        failed = []
+        for path in paths:
+            f = F(parent_id=folder_id, storage_id=folder.contents.storage_id, filename=path.name.encode(),
+                  filesize=path.stat().st_size, filetype=44)  # 44 = LIBMTP_FILETYPE_UNKNOWN
+            if lib.LIBMTP_Send_File_From_File(dev, str(path).encode(), C.byref(f), None, None):
+                failed.append(path.name)
+        return failed
+    finally:
+        lib.LIBMTP_Release_Device(dev)
+
+
+def workouts():
+    """Turn the latest coach plan into workout files and copy them onto the watch (Training > Workouts)."""
+    if not (DATA / "coach.md").exists():
+        sys.exit(f"No coach review for '{DATA.name}' yet. Run: garmin.py {DATA.name} coach")
+    serial = check_watch()
+    if not serial:
+        sys.exit("No Garmin watch found over USB. Plug it in and unlock it.")
+    answer = ask_claude(WORKOUT_PROMPT + "\n\n" + (DATA / "coach.md").read_text(), DATA / "workouts_request.md")
+    plan = json.loads(re.sub(r"\A```\w*\n|\n```\Z", "", answer))
+    plan = [w for w in plan if w["date"] >= f"{datetime.now():%Y-%m-%d}"]
+    folder = re.search(r"(?m)^  (\d+) NewFiles$", subprocess.run(["mtp-filetree"], capture_output=True, text=True).stdout)
+    if not folder:
+        sys.exit("No GARMIN/NewFiles folder on the watch. Is it unlocked? (Close Garmin Express / Android File Transfer.)")
+    out = DATA / "workouts"
+    out.mkdir(exist_ok=True)
+    (out / "plan.json").write_text(json.dumps(plan, indent=1))
+    files = []
+    for w in plan:
+        w["name"] = f"{w['date'][5:]} {w['name']}"[:21]  # date first so the watch list sorts and shows which day
+        files.append(out / f"{w['date']}.fit")
+        files[-1].write_bytes(workout_fit(w))
+        print(w["name"])
+    missing = mtp_send(int(folder[1]), files)  # the watch imports anything in NewFiles when it is unplugged
+    if missing:
+        sys.exit(f"Not on the watch: {missing}. Files are in {out}; copy them to GARMIN/NewFiles by hand.")
+    print(f"{len(files)} workouts copied. Unplug the watch to import them, then find them under Training > Workouts.")
 
 
 def write_csv(path: Path, rows: list[dict], first: list[str]):
@@ -367,6 +487,16 @@ def demo():
     rec = lambda i, cad: {"timestamp": t0 + timedelta(seconds=i), "cadence": cad, "enhanced_speed": 2.5, "heart_rate": 140}
     recs = [rec(i, 80) for i in range(300)] + [rec(i, 55) for i in range(300, 360)] + [rec(i, 80) for i in range(360, 541)]
     m = run_metrics(recs, [110, 130, 150, 170, 190])
+    w = {"name": "test", "steps": [{"min": 5, "kind": "warmup"}, {"repeat": 3, "steps": [{"min": 5, "hr": [140, 150]}, {"min": 2, "kind": "recovery"}]}, {"kind": "cooldown"}]}
+    from garmin_fit_sdk import Decoder, Stream
+    d, err = Decoder(Stream.from_byte_array(bytearray(workout_fit(w)))).read()
+    st = d["workout_step_mesgs"]
+    assert not err and d["file_id_mesgs"][0]["type"] == "workout" and d["workout_mesgs"][0]["num_valid_steps"] == 5, (err, d)
+    assert st[1]["custom_target_heart_rate_low"] == 240 and st[1]["duration_time"] == 300, st[1]
+    assert st[3]["duration_type"] == "repeat_until_steps_cmplt" and st[3]["duration_step"] == 1 and st[3]["repeat_steps"] == 3, st[3]
+    assert st[4]["duration_type"] == "open" and st[4]["intensity"] == "cooldown"
+    ids = {Decoder(Stream.from_byte_array(bytearray(workout_fit({**w, "name": n})))).read()[0]["file_id_mesgs"][0]["serial_number"] for n in ("a", "b")}
+    assert len(ids) == 2, "workouts written together must not share a file_id"
     assert m["longest_run_min"] == 5.0 and m["walk_pct"] == 11.1 and m["z2_pace_min_per_km"] == 6.67 and m["hr_zone_2_s"] == 540 and "z3_pace_min_per_km" not in m, m
 
 
@@ -378,6 +508,8 @@ if __name__ == "__main__":
     cmd = sys.argv[2] if len(sys.argv) > 2 else "all"
     if cmd == "coach":
         coach(" ".join(sys.argv[3:]))  # garmin.py robin coach "optional note, e.g. sore calf"
+    if cmd == "workouts":
+        workouts()
     if cmd in ("pull", "all"):
         pull()
     if cmd in ("parse", "all"):
