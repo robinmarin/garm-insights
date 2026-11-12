@@ -39,7 +39,6 @@ header { display: flex; align-items: baseline; gap: 12px; }
 .chips button { font: inherit; color: var(--ink2); background: none; border: 1px solid var(--axis); border-radius: 6px; padding: 1px 8px; cursor: pointer; }
 .chips button[aria-pressed="true"] { background: var(--series); border-color: var(--series); color: #fff; }
 .chips button:disabled { opacity: .35; cursor: default; }
-#ctl input[type=checkbox] { padding: 0; vertical-align: -2px; accent-color: var(--series); }
 dialog { color: var(--ink); background: var(--surface); border: 1px solid var(--axis); border-radius: 10px; width: min(92vw, 100ch); max-height: 88vh; padding: 16px 20px; }
 dialog::backdrop { background: rgba(0,0,0,.45); }
 dialog form { display: flex; gap: 8px; align-items: center; position: sticky; top: -16px; background: var(--surface); padding: 6px 0; }
@@ -47,6 +46,16 @@ dialog form span { margin-right: auto; color: var(--ink2); }
 dialog table { border-collapse: collapse; margin: 8px 0; }
 dialog th, dialog td { border-bottom: 1px solid var(--grid); padding: 4px 10px 4px 0; text-align: left; vertical-align: top; white-space: normal; }
 dialog p { margin: 8px 0; max-width: 80ch; }
+.box { padding: 4px 0 12px; }
+.box label { display: flex; justify-content: space-between; align-items: baseline; }
+.box label span { color: var(--muted); }
+.box textarea { display: block; width: 100%; font: inherit; color: var(--ink); background: none; border: 1px solid var(--grid); border-radius: 4px; padding: 4px 6px; margin-top: 4px; resize: vertical; }
+.box textarea:hover { border-color: var(--axis); }
+.goal { border-bottom: 1px solid var(--grid); margin-bottom: 4px; }
+.goal textarea { font-size: 16px; border-color: transparent; padding-left: 0; }
+.goal textarea:focus { padding-left: 6px; }
+.note { border-top: 1px solid var(--grid); margin-top: 12px; padding-top: 12px; }
+.note button { margin-top: 8px; }
 #msg { color: var(--ink2); max-width: 46ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 h1 { font-size: 17px; margin: 0; font-weight: 600; }
 header span, .sub { color: var(--ink2); }
@@ -80,9 +89,8 @@ th:first-child, td:first-child { text-align: left; padding-left: 0; }
   <div id="ctl" hidden><span id="msg" role="status"></span>
     <label>Profile <select id="profile"></select></label>
     <input id="newp" size="14" placeholder="or new profile" aria-label="New profile name">
-    <label title="After the fetch, send the new data to the coach"><input type="checkbox" id="withcoach"> then ask the coach</label>
     <button id="fetch"></button><button id="coach">Coach</button></div></header>
-<dialog id="review"><form method="dialog"><span id="cmsg" role="status"></span><button id="ask" type="button">New review</button><button>Close</button></form><div id="rtext"></div></dialog>
+<dialog id="review"><form method="dialog"><span id="cmsg" role="status"></span><button id="ask" type="button">New review</button><button>Close</button></form><section class="box goal"><label for="goal"><b>Your goal</b><span id="gstat">Saves when you click away</span></label><textarea id="goal" rows="3" placeholder="For example: run 5K without stopping by spring. Or: a sub-20 5K, no rush."></textarea></section><div id="rtext"></div><section class="box note"><label for="answers"><b>Note for the coach</b><span>Optional</span></label><textarea id="answers" rows="4" placeholder="What the watch can't see: pain, illness, travel, or an assumption above that is wrong."></textarea><button id="send" type="button">Send note and revise the plan</button></section></dialog>
 <section class="tiles" id="tiles"></section>
 <section class="row" style="grid-template-columns: 1fr">
   <div class="card">
@@ -271,7 +279,7 @@ if (location.protocol.startsWith("http")) {
     sel.innerHTML = ps.map(p => `<option${p === me ? " selected" : ""}>${p}</option>`).join(""); label();
   });
   sel.onchange = () => location.href = "/p/" + sel.value;
-  const post = async (what, p) => (await fetch(`/api/${what}/${p}`, { method: "POST", headers: { "X-Garmin": "1" } })).json();
+  const post = async (what, p, body = "") => (await fetch(`/api/${what}/${p}`, { method: "POST", headers: { "X-Garmin": "1" }, body })).json();
   // ---- coach review: the markdown garmin.py saved, shown in a dialog
   const esc = s => s.replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
   // ponytail: handles only what the coach prompt asks for (bold, headings, tables, paragraphs). Use a markdown lib if reviews get richer.
@@ -279,29 +287,27 @@ if (location.protocol.startsWith("http")) {
     .map(l => l[0] === "|" ? "<tr>" + l.slice(1, -1).split("|").map(c => `<td>${c.trim()}</td>`).join("") + "</tr>" : l[0] === "#" ? `<h1>${l.replace(/^#+ /, "")}</h1>` : `<p>${l}</p>`)
     .join("").replace(/(<tr>.*?<\/tr>)+/g, "<table>$&</table>");
   const show = async () => {
-    const t = await (await fetch("/api/coach/" + me)).text();
-    $("rtext").innerHTML = t ? md(t) : "<p>No review yet. New review sends this profile's digest and goal.txt to Claude.</p>";
+    const [t, g] = await Promise.all(["coach", "goal"].map(async w => (await fetch(`/api/${w}/${me}`)).text()));
+    $("goal").value = g.trim();
+    $("rtext").innerHTML = t ? md(t) : "<p>No review yet. Write a goal above, then press New review to send it with this profile's runs to the coach.</p>";
     if (!$("review").open) $("review").showModal();
   };
   $("coach").onclick = show;
-  $("ask").onclick = async () => {
-    $("ask").disabled = true; $("cmsg").textContent = "Asking the coach… a minute or two";
-    try { const c = await post("coach", me); $("cmsg").textContent = c.ok ? "" : c.message; await show(); }
+  const ask = async body => {
+    $("ask").disabled = $("send").disabled = true; $("cmsg").textContent = "Asking the coach… a minute or two";
+    try { const c = await post("coach", me, body); $("cmsg").textContent = c.ok ? "" : c.message; if (c.ok) $("answers").value = ""; await show(); }
     catch { $("cmsg").textContent = "Could not reach garmin.py serve"; }
-    $("ask").disabled = false;
+    $("ask").disabled = $("send").disabled = false;
   };
-  if (sessionStorage.getItem("coach")) { sessionStorage.removeItem("coach"); show(); }
+  $("goal").onchange = async () => { const r = await post("goal", me, $("goal").value); $("gstat").textContent = r.ok ? "Saved. Press New review to plan for it." : r.message; };
+  $("ask").onclick = () => ask("");
+  $("send").onclick = () => $("answers").value.trim() ? ask($("answers").value) : $("answers").focus();
   btn.onclick = async () => {
     const p = target();
     if (!/^\w+$/.test(p)) return msg.textContent = "Profile names use letters, numbers and underscores only";
     btn.disabled = true; msg.textContent = "Fetching… about 20 seconds, or several minutes for a first pull";
     try {
       const r = await post("pull", p);
-      if (r.ok && $("withcoach").checked) {
-        msg.textContent = "Fetched. Asking the coach… a minute or two";
-        const c = await post("coach", p);
-        sessionStorage.setItem(c.ok ? "coach" : "msg", c.ok ? "1" : c.message); return location.href = "/p/" + p;
-      }
       if (r.ok) { sessionStorage.setItem("msg", r.message); return location.href = "/p/" + p; }
       msg.textContent = msg.title = r.message;
     } catch { msg.textContent = "Could not reach garmin.py serve"; }

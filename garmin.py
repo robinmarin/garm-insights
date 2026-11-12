@@ -221,9 +221,9 @@ def serve(port=8765):
             profiles = sorted(d.name for d in data.iterdir() if d.is_dir()) if data.exists() else []
             if self.path == "/api/profiles":
                 return self.reply(profiles)
-            m = re.fullmatch(r"/api/coach/(\w+)", self.path)
+            m = re.fullmatch(r"/api/(coach|goal)/(\w+)", self.path)
             if m:
-                f = data / m[1] / "coach.md"
+                f = data / m[2] / ("coach.md" if m[1] == "coach" else "goal.txt")
                 return self.reply(f.read_text() if f.exists() else "", "text/plain; charset=utf-8")
             m = re.fullmatch(r"/p/(\w+)", self.path)
             if not m:
@@ -234,10 +234,15 @@ def serve(port=8765):
             self.reply(f.read_text() if f.exists() else render([], m[1]), "text/html; charset=utf-8")
 
         def do_POST(self):
-            m = re.fullmatch(r"/api/(pull|coach)/(\w+)", self.path)
+            m = re.fullmatch(r"/api/(pull|coach|goal)/(\w+)", self.path)
             # The custom header can't be sent cross-site without a CORS preflight, so other web pages can't trigger a pull.
             if not m or self.headers.get("X-Garmin") != "1":
                 return self.send_error(400)
+            body = self.rfile.read(int(self.headers.get("Content-Length") or 0)).decode()
+            if m[1] == "goal":
+                (ROOT / "data" / m[2]).mkdir(parents=True, exist_ok=True)
+                (ROOT / "data" / m[2] / "goal.txt").write_text(body.strip() + "\n")
+                return self.reply({"ok": True, "message": "Goal saved"})
             if not busy.acquire(blocking=False):
                 return self.reply({"ok": False, "message": "A fetch or review is already running"})
             log = io.StringIO()
@@ -245,7 +250,7 @@ def serve(port=8765):
                 with contextlib.redirect_stdout(log):
                     set_profile(m[2])
                     if m[1] == "coach":
-                        coach()
+                        coach(body)
                     else:
                         pull()
                         parse()
@@ -265,17 +270,21 @@ def serve(port=8765):
     ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
 
 
-def coach():
-    """Wrap goal, last review and digest in the coach prompt, send it to Claude, save the answer."""
+def coach(note=""):
+    """Wrap goal, the runner's notes, last review and digest in the coach prompt, send it to Claude, save the answer."""
     def part(title, path, missing):
         return f"\n\n## {title}\n\n{path.read_text().strip() if path.exists() else missing}"
 
     if not (DATA / "digest.md").exists():
         sys.exit(f"No digest for '{DATA.name}' yet. Run: garmin.py {DATA.name}")
+    if note.strip():  # kept for every later review, so the coach plans around it from then on
+        with open(DATA / "notes.md", "a") as f:
+            f.write(f"### {datetime.now():%Y-%m-%d}\n\n{note.strip()}\n\n")
     prompt = ((ROOT / "coach_prompt.md").read_text().strip()
               + f"\n\n## Today\n\n{datetime.now():%A %Y-%m-%d}"
               + part("The runner's goal, in their words", DATA / "goal.txt",
-                     "Not stated. Coach for general fitness and ask what they are training for.")
+                     "Not stated. Coach for general fitness, starting with 30 minutes of continuous easy running, and list this under What I assumed.")
+              + part("The runner's notes, oldest first", DATA / "notes.md", "None yet.")
               + part("Your previous review", DATA / "coach.md", "None. This is the first review.")
               + part("Training log", DATA / "digest.md", ""))
     sent = DATA / "coach_request.md"  # the full wrapped prompt; paste it into any other LLM if you prefer
@@ -360,7 +369,7 @@ if __name__ == "__main__":
     set_profile(sys.argv[1] if len(sys.argv) > 1 else "")
     cmd = sys.argv[2] if len(sys.argv) > 2 else "all"
     if cmd == "coach":
-        coach()
+        coach(" ".join(sys.argv[3:]))  # garmin.py robin coach "optional note, e.g. sore calf"
     if cmd in ("pull", "all"):
         pull()
     if cmd in ("parse", "all"):
