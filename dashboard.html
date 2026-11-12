@@ -12,6 +12,7 @@
   --grid: #e1e0d9; --axis: #c3c2b7; --border: rgba(11,11,11,.10);
   --series: #2a78d6; --easy: #86b6ef; --mod: #2a78d6; --hard: #104281;
   --good: #006300; --bad: #d03b3b;
+  --push: #19733a; --push-ink: #fff;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -20,6 +21,7 @@
     --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,.10);
     --series: #3987e5; --easy: #184f95; --mod: #3987e5; --hard: #9ec5f4;
     --good: #0ca30c; --bad: #e66767;
+    --push: #3fae66; --push-ink: #0d0d0d;
   }
 }
 * { box-sizing: border-box; }
@@ -33,6 +35,8 @@ header { display: flex; align-items: baseline; gap: 12px; }
 #ctl[hidden] { display: none; }
 #ctl select, #ctl input, #ctl button, dialog button { font: inherit; color: var(--ink); background: var(--surface); border: 1px solid var(--axis); border-radius: 6px; padding: 3px 8px; }
 #ctl button, dialog button { background: var(--series); border-color: var(--series); color: #fff; cursor: pointer; }
+dialog #push { background: var(--push); border-color: var(--push); color: var(--push-ink); }
+dialog #close { background: none; border-color: var(--axis); color: var(--ink); }
 #ctl button:disabled, dialog button:disabled { opacity: .6; cursor: wait; }
 .pick { font: inherit; color: var(--ink); background: var(--surface); border: 1px solid var(--axis); border-radius: 6px; padding: 2px 6px; }
 .chips { display: flex; gap: 4px; }
@@ -58,6 +62,8 @@ dialog p { margin: 8px 0; max-width: 80ch; }
 .goal textarea:focus { padding-left: 6px; }
 .note { border-top: 1px solid var(--grid); margin-top: 12px; padding-top: 12px; }
 .note button { margin-top: 8px; }
+.wipe { border-top: 1px solid var(--grid); padding-top: 12px; display: flex; gap: 8px; align-items: baseline; color: var(--muted); }
+dialog #wipe { background: none; border-color: var(--bad); color: var(--bad); }
 #msg { color: var(--ink2); max-width: 46ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 h1 { font-size: 17px; margin: 0; font-weight: 600; }
 header span, .sub { color: var(--ink2); }
@@ -92,7 +98,7 @@ th:first-child, td:first-child { text-align: left; padding-left: 0; }
     <label>Profile <select id="profile"></select></label>
     <input id="newp" size="14" placeholder="or new profile" aria-label="New profile name">
     <button id="fetch"></button><button id="coach">Coach</button></div></header>
-<dialog id="review"><form method="dialog"><span id="cmsg" role="status"></span><span class="chips" id="hist" hidden><button id="older" type="button" aria-label="Older review">‹</button><span id="which"></span><button id="newer" type="button" aria-label="Newer review">›</button></span><button id="ask" type="button">New review</button><button>Close</button></form><section class="box goal"><label for="goal"><b>Your goal</b><span id="gstat">Saves when you click away</span></label><textarea id="goal" rows="3" placeholder="For example: run 5K without stopping by spring. Or: a sub-20 5K, no rush."></textarea></section><div id="rtext"></div><section class="box note"><label for="answers"><b>Note for the coach</b><span>Optional</span></label><textarea id="answers" rows="4" placeholder="What the watch can't see: pain, illness, travel, or an assumption above that is wrong."></textarea><button id="send" type="button">Send note and revise the plan</button></section></dialog>
+<dialog id="review"><form method="dialog"><span id="cmsg" role="status"></span><span class="chips" id="hist" hidden><button id="older" type="button" aria-label="Older review">‹</button><span id="which"></span><button id="newer" type="button" aria-label="Newer review">›</button></span><button id="ask" type="button">New review</button><button id="push" type="button">Push workouts to watch</button><button id="close">Close</button></form><section class="box goal"><label for="goal"><b>Your goal</b><span id="gstat">Saves when you click away</span></label><textarea id="goal" rows="3" placeholder="For example: run 5K without stopping by spring. Or: a sub-20 5K, no rush."></textarea></section><div id="rtext"></div><section class="box note"><label for="answers"><b>Note for the coach</b><span>Optional</span></label><textarea id="answers" rows="4" placeholder="What the watch can't see: pain, illness, travel, or an assumption above that is wrong."></textarea><button id="send" type="button">Send note and revise the plan</button></section><section class="box wipe"><button id="wipe" type="button">Remove all planned workouts from the watch</button><span>Garmin's own workouts stay. Use it if the watch list gets messy.</span></section></dialog>
 <section class="tiles" id="tiles"></section>
 <section class="row" style="grid-template-columns: 1fr">
   <div class="card">
@@ -312,6 +318,20 @@ if (location.protocol.startsWith("http")) {
   };
   $("goal").onchange = async () => { const r = await post("goal", me, $("goal").value); $("gstat").textContent = r.ok ? "Saved. Press New review to plan for it." : r.message; };
   $("ask").onclick = () => ask("");
+  // Copies the latest review's plan to the watch as workouts; the server needs the watch plugged in.
+  $("wipe").onclick = async () => {
+    if (!confirm("Remove every workout this dashboard put on the watch, including future ones?")) return;
+    $("wipe").disabled = true; $("cmsg").textContent = "Removing workouts from the watch…";
+    try { $("cmsg").textContent = (await post("wipe", me)).message; }
+    catch { $("cmsg").textContent = "Could not reach garmin.py serve"; }
+    $("wipe").disabled = false;
+  };
+  $("push").onclick = async () => {
+    $("push").disabled = true; $("cmsg").textContent = "Copying workouts to the watch…";
+    try { $("cmsg").textContent = (await post("workouts", me)).message; }
+    catch { $("cmsg").textContent = "Could not reach garmin.py serve"; }
+    $("push").disabled = false;
+  };
   $("send").onclick = () => $("answers").value.trim() ? ask($("answers").value) : $("answers").focus();
   btn.onclick = async () => {
     const p = target();

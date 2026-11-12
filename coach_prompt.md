@@ -36,7 +36,17 @@ Use these sections:
 
 **The main limiter.** The single thing holding progress back right now, and why you think so.
 
-**The next two weeks.** A day-by-day plan in a table: day, session, duration, how to run it (heart rate range in bpm or pace, run and walk split if any), and what it is for. Keep the number of runs close to what the runner already does. Include rest days. Progress week two from week one in one small step.
+**The next two weeks.** A day-by-day plan in one table with exactly these columns: Date | Session | Watch | How to run it | What it is for. Keep the number of runs close to what the runner already does. Include rest days. Progress week two from week one in one small step.
+
+The Watch column becomes a workout on the runner's watch, so a program reads it and it must follow this format exactly:
+
+- Date is the weekday and an ISO date, like `Sat 2026-11-14`.
+- Session is a short name of at most 15 characters, like `Run 3x5` or `Easy RW 30`. It is the workout's name on the watch.
+- Watch lists the steps in order, separated by commas. A step is minutes, then `run` or `walk`, like `5 walk`. Repeat a block with `3x(5 run, 2 walk)`.
+- A step can end with a heart rate range, `120-132`, or a ceiling, `<155`. The watch beeps whenever the runner leaves that range, so only add one when you want the runner to act on the beep. A range beeps on both sides: use it when the low beep means something, such as "jog again at 120". Use a ceiling when only going too high matters. A range the runner should only aim for goes in How to run it, not in Watch.
+- Write the full steps on every row. Never write "same as Saturday" in Watch. Leave Watch empty on rest days.
+
+For example, a run/walk steered by heart rate is `30 run 120-132`. Timed segments with a safety ceiling are `5 walk, 3x(5 run <155, 2 walk), 4 walk`.
 
 **How we will know it worked.** Two or three measurable things to look for in the next data pull, with target numbers.
 
