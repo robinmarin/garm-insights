@@ -5,6 +5,8 @@
     .venv/bin/python garmin.py robin pull    # watch -> data/robin/raw/*.fit (only new files)
     .venv/bin/python garmin.py robin parse   # raw -> runs.csv, laps.csv, records/*.csv
 
+    .venv/bin/python garmin.py robin coach   # digest + coach_prompt.md -> Claude -> data/robin/coach.md
+
     .venv/bin/python garmin.py serve         # dashboard at http://127.0.0.1:8765 with a fetch button
 
 One profile per person; plug in one watch at a time and name whose it is.
@@ -20,14 +22,16 @@ import subprocess
 import sys
 from pathlib import Path
 
+COACH_MODEL = "sonnet"  # model alias for the coach review; "opus" if Sonnet's reviews fall short
+
 ROOT = Path(__file__).parent
 DATA = RAW = None  # set by set_profile()
 
 
 def set_profile(name: str):
     global DATA, RAW
-    if not re.fullmatch(r"\w+", name) or name in ("pull", "parse", "serve"):
-        sys.exit("usage: garmin.py <profile> [pull|parse]  |  garmin.py serve")
+    if not re.fullmatch(r"\w+", name) or name in ("pull", "parse", "serve", "coach"):
+        sys.exit("usage: garmin.py <profile> [pull|parse|coach]  |  garmin.py serve")
     DATA = ROOT / "data" / name
     RAW = DATA / "raw"
 
@@ -194,7 +198,7 @@ def render(rows: list, name: str, top: list = ()) -> str:
 
 
 def serve(port=8765):
-    """Local-only server: shows each profile's dashboard and lets its button run pull + parse."""
+    """Local-only server: shows each profile's dashboard and lets its buttons run pull + parse and the coach review."""
     import contextlib
     import io
     import threading
@@ -217,6 +221,10 @@ def serve(port=8765):
             profiles = sorted(d.name for d in data.iterdir() if d.is_dir()) if data.exists() else []
             if self.path == "/api/profiles":
                 return self.reply(profiles)
+            m = re.fullmatch(r"/api/coach/(\w+)", self.path)
+            if m:
+                f = data / m[1] / "coach.md"
+                return self.reply(f.read_text() if f.exists() else "", "text/plain; charset=utf-8")
             m = re.fullmatch(r"/p/(\w+)", self.path)
             if not m:
                 self.send_response(302)
@@ -226,20 +234,23 @@ def serve(port=8765):
             self.reply(f.read_text() if f.exists() else render([], m[1]), "text/html; charset=utf-8")
 
         def do_POST(self):
-            m = re.fullmatch(r"/api/pull/(\w+)", self.path)
+            m = re.fullmatch(r"/api/(pull|coach)/(\w+)", self.path)
             # The custom header can't be sent cross-site without a CORS preflight, so other web pages can't trigger a pull.
             if not m or self.headers.get("X-Garmin") != "1":
                 return self.send_error(400)
             if not busy.acquire(blocking=False):
-                return self.reply({"ok": False, "message": "A fetch is already running"})
+                return self.reply({"ok": False, "message": "A fetch or review is already running"})
             log = io.StringIO()
             try:
                 with contextlib.redirect_stdout(log):
-                    set_profile(m[1])
-                    pull()
-                    parse()
+                    set_profile(m[2])
+                    if m[1] == "coach":
+                        coach()
+                    else:
+                        pull()
+                        parse()
                 lines = [l for l in log.getvalue().splitlines() if not l.startswith("[")]
-                self.reply({"ok": True, "message": " · ".join(lines)})
+                self.reply({"ok": True, "message": "Review ready" if m[1] == "coach" else " · ".join(lines)})
             except SystemExit as e:
                 self.reply({"ok": False, "message": str(e)})
             except Exception as e:
@@ -252,6 +263,33 @@ def serve(port=8765):
     webbrowser.open(url)
     # Threaded because browsers hold idle connections open, which stalls a single-threaded server.
     ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
+
+
+def coach():
+    """Wrap goal, last review and digest in the coach prompt, send it to Claude, save the answer."""
+    def part(title, path, missing):
+        return f"\n\n## {title}\n\n{path.read_text().strip() if path.exists() else missing}"
+
+    if not (DATA / "digest.md").exists():
+        sys.exit(f"No digest for '{DATA.name}' yet. Run: garmin.py {DATA.name}")
+    prompt = ((ROOT / "coach_prompt.md").read_text().strip()
+              + f"\n\n## Today\n\n{datetime.now():%A %Y-%m-%d}"
+              + part("The runner's goal, in their words", DATA / "goal.txt",
+                     "Not stated. Coach for general fitness and ask what they are training for.")
+              + part("Your previous review", DATA / "coach.md", "None. This is the first review.")
+              + part("Training log", DATA / "digest.md", ""))
+    sent = DATA / "coach_request.md"  # the full wrapped prompt; paste it into any other LLM if you prefer
+    sent.write_text(prompt + "\n")
+    try:
+        # ponytail: uses the logged-in claude CLI, so no API key or SDK. Swap for the anthropic SDK if this runs unattended.
+        out = subprocess.run(["claude", "-p", "--model", COACH_MODEL], input=prompt, capture_output=True, text=True, timeout=900, cwd=DATA)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        sys.exit(f"Could not reach Claude ({e}). The prompt is in {sent}.")
+    if out.returncode or not out.stdout.strip():
+        sys.exit(f"Claude failed: {out.stderr.strip() or 'empty answer'}. The prompt is in {sent}.")
+    text = re.sub(r"\A#[^\n]*\n+", "", out.stdout.strip())  # it sometimes repeats the previous review's title
+    (DATA / "coach.md").write_text(f"# Coach review: {DATA.name}, {datetime.now():%Y-%m-%d}\n\n{text}\n")
+    print(text, f"\n\nSaved to {DATA / 'coach.md'}")
 
 
 def write_csv(path: Path, rows: list[dict], first: list[str]):
@@ -321,6 +359,8 @@ if __name__ == "__main__":
         serve()
     set_profile(sys.argv[1] if len(sys.argv) > 1 else "")
     cmd = sys.argv[2] if len(sys.argv) > 2 else "all"
+    if cmd == "coach":
+        coach()
     if cmd in ("pull", "all"):
         pull()
     if cmd in ("parse", "all"):
