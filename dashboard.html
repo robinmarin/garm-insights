@@ -55,7 +55,7 @@ dialog p { margin: 8px 0; max-width: 80ch; }
 .box { padding: 4px 0 12px; }
 .box label { display: flex; justify-content: space-between; align-items: baseline; }
 .box label span { color: var(--muted); }
-.box textarea { display: block; width: 100%; font: inherit; color: var(--ink); background: none; border: 1px solid var(--grid); border-radius: 4px; padding: 4px 6px; margin-top: 4px; resize: vertical; }
+.box textarea { display: block; width: 100%; font: inherit; color: var(--ink); background: none; border: 1px solid var(--grid); border-radius: 4px; padding: 4px 6px; margin-top: 4px; resize: none; overflow: hidden; }
 .box textarea:hover { border-color: var(--axis); }
 .goal { border-bottom: 1px solid var(--grid); margin-bottom: 4px; }
 .goal textarea { font-size: 16px; border-color: transparent; padding-left: 0; }
@@ -308,7 +308,11 @@ if (location.protocol.startsWith("http")) {
     const [rs, g] = await Promise.all([fetch(`/api/reviews/${me}`).then(r => r.json()), fetch(`/api/goal/${me}`).then(r => r.text())]);
     revs = rs; at = 0; $("goal").value = g.trim(); view();
     if (!$("review").open) $("review").showModal();
+    fit();  // after showModal: a closed dialog has no layout to measure
   };
+  // Grow each textarea to its text so only the dialog scrolls. ponytail: CSS field-sizing does this, swap in once Firefox has it.
+  const fit = () => document.querySelectorAll(".box textarea").forEach(t => { t.style.height = "auto"; t.style.height = t.scrollHeight + 2 + "px"; });
+  document.querySelectorAll(".box textarea").forEach(t => t.oninput = fit);
   $("coach").onclick = show;
   $("older").onclick = () => { at++; view(); };
   $("newer").onclick = () => { at--; view(); };
