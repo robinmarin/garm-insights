@@ -196,6 +196,7 @@ def write_dashboard(runs: list[dict], top: list):
              "longest": r.get("longest_run_min"), "walk": r.get("walk_pct"),
              "cad": r["avg_running_cadence"] * 2 if r.get("avg_running_cadence") else None} for r in runs]
     (DATA / "dashboard.html").write_text(render(rows, DATA.name, top))
+    (DATA / "dashboard.json").write_text(json.dumps({"rows": rows, "top": list(top)}))  # serve renders from this, so template edits show up
 
 
 def render(rows: list, name: str, top: list = ()) -> str:
@@ -244,8 +245,10 @@ def serve(port=8765):
                 self.send_response(302)
                 self.send_header("Location", f"/p/{profiles[0] if profiles else 'me'}")
                 return self.end_headers()
-            f = data / m[1] / "dashboard.html"
-            self.reply(f.read_text() if f.exists() else render([], m[1]), "text/html; charset=utf-8")
+            # Render the current template on every load. The saved dashboard.html keeps whatever template it was parsed with.
+            f, old = data / m[1] / "dashboard.json", data / m[1] / "dashboard.html"
+            page = render(**json.loads(f.read_text()), name=m[1]) if f.exists() else old.read_text() if old.exists() else render([], m[1])
+            self.reply(page, "text/html; charset=utf-8")
 
         def do_POST(self):
             m = re.fullmatch(r"/api/(pull|coach|goal|workouts|wipe)/(\w+)", self.path)

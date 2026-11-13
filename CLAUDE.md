@@ -24,9 +24,9 @@ There is no test suite or linter. `demo()` at the bottom of `garmin.py` holds as
 
 ## Layout
 
-Everything is in `garmin.py`. `dashboard.html` is a template, not a page: `render()` substitutes the literal markers `/*DATA*/[]`, `/*ZONES*/[]` and `/*NAME*/` and writes the result to `data/<profile>/dashboard.html`. Keep those markers intact when editing the template. The page renders fine with empty data, which `serve` relies on for a profile with no runs yet.
+Everything is in `garmin.py`. `dashboard.html` is a template, not a page: `render()` substitutes the literal markers `/*DATA*/[]`, `/*ZONES*/[]` and `/*NAME*/` and writes the result to `data/<profile>/dashboard.html`, plus the same data as `dashboard.json`. `serve` renders the current template from `dashboard.json` on every page load, so a template change shows up without a re-parse. Keep those markers intact when editing the template. The page renders fine with empty data, which `serve` relies on for a profile with no runs yet.
 
-`data/` is gitignored and holds personal data. Per profile it contains `raw/`, the CSVs, `digest.md`, `dashboard.html`, `watch.txt` (serial of the watch first pulled into it), `goal.txt`, `notes.md` (runner notes appended on each coach call), `coach.md` (last review, the one fed into the next prompt), `coach/<YYYY-MM-DD-HHMMSS>.md` (every review, browsable in the dashboard), `coach_request.md` (the full prompt last sent), `workouts/` (the plan as `plan.json` plus one `<date>.fit` per session).
+`data/` is gitignored and holds personal data. Per profile it contains `raw/`, the CSVs, `digest.md`, `dashboard.html`, `dashboard.json`, `watch.txt` (serial of the watch first pulled into it), `goal.txt`, `notes.md` (runner notes appended on each coach call), `coach.md` (last review, the one fed into the next prompt), `coach/<YYYY-MM-DD-HHMMSS>.md` (every review, browsable in the dashboard), `coach_request.md` (the full prompt last sent), `workouts/` (the plan as `plan.json` plus one `<date>.fit` per session).
 
 ## Things that span several functions
 
