@@ -212,6 +212,7 @@ def serve(port=8765):
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     busy = threading.Lock()  # pull/parse use module globals, so one fetch at a time
+    job = {"log": io.StringIO()}  # stdout of the running POST, read by /api/progress
 
     class H(BaseHTTPRequestHandler):
         def reply(self, body, ctype="application/json"):
@@ -227,6 +228,9 @@ def serve(port=8765):
             profiles = sorted(d.name for d in data.iterdir() if d.is_dir()) if data.exists() else []
             if self.path == "/api/profiles":
                 return self.reply(profiles)
+            if self.path == "/api/progress":  # [done, total] from pull's last "[k/n] name" line, [] before the first file
+                done = re.findall(r"^\[(\d+)/(\d+)\]", job["log"].getvalue(), re.M)
+                return self.reply([int(x) for x in done[-1]] if done else [])
             m = re.fullmatch(r"/api/goal/(\w+)", self.path)
             if m:
                 f = data / m[1] / "goal.txt"
@@ -255,7 +259,7 @@ def serve(port=8765):
                 return self.reply({"ok": True, "message": "Goal saved"})
             if not busy.acquire(blocking=False):
                 return self.reply({"ok": False, "message": "A fetch or review is already running"})
-            log = io.StringIO()
+            log = job["log"] = io.StringIO()
             try:
                 with contextlib.redirect_stdout(log):
                     set_profile(m[2])

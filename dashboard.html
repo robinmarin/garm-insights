@@ -64,6 +64,8 @@ dialog p { margin: 8px 0; max-width: 80ch; }
 .note button { margin-top: 8px; }
 .wipe { border-top: 1px solid var(--grid); padding-top: 12px; display: flex; gap: 8px; align-items: baseline; color: var(--muted); }
 dialog #wipe { background: none; border-color: var(--bad); color: var(--bad); }
+#bar { width: 120px; accent-color: var(--series); }
+#bar[hidden] { display: none; }
 #msg { color: var(--ink2); max-width: 46ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 h1 { font-size: 17px; margin: 0; font-weight: 600; }
 header span, .sub { color: var(--ink2); }
@@ -94,7 +96,7 @@ th:first-child, td:first-child { text-align: left; padding-left: 0; }
 </head>
 <body>
 <header><h1>Running: /*NAME*/</h1><span id="range"></span>
-  <div id="ctl" hidden><span id="msg" role="status"></span>
+  <div id="ctl" hidden><progress id="bar" hidden></progress><span id="msg" role="status"></span>
     <label>Profile <select id="profile"></select></label>
     <input id="newp" size="14" placeholder="or new profile" aria-label="New profile name">
     <button id="fetch"></button><button id="coach">Coach</button></div></header>
@@ -336,12 +338,20 @@ if (location.protocol.startsWith("http")) {
   btn.onclick = async () => {
     const p = target();
     if (!/^\w+$/.test(p)) return msg.textContent = "Profile names use letters, numbers and underscores only";
-    btn.disabled = true; msg.textContent = "Fetching… about 20 seconds, or several minutes for a first pull";
+    btn.disabled = true; msg.textContent = "Reading the watch…";
+    const bar = $("bar"); bar.hidden = false; bar.removeAttribute("value");  // no value = indeterminate until the first file lands
+    const tick = setInterval(async () => {
+      const [k, n] = await fetch("/api/progress").then(r => r.json()).catch(() => []);
+      if (!n) return;
+      bar.max = n; bar.value = k;
+      msg.textContent = k < n ? `Copying file ${k + 1} of ${n}…` : "Building the dashboard…";
+    }, 1000);
     try {
       const r = await post("pull", p);
       if (r.ok) { sessionStorage.setItem("msg", r.message); return location.href = "/p/" + p; }
       msg.textContent = msg.title = r.message;
     } catch { msg.textContent = "Could not reach garmin.py serve"; }
+    clearInterval(tick); bar.hidden = true;
     btn.disabled = false;
   };
 }
