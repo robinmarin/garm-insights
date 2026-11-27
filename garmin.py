@@ -75,14 +75,25 @@ def check_watch() -> str | None:
 
 def pull():
     serial, known = check_watch(), DATA / "watch.txt"
-    tree = subprocess.run(["mtp-filetree"], capture_output=True, text=True).stdout
-    files = folder_files(tree, "Activity")
+    run = subprocess.run(["mtp-filetree"], capture_output=True, text=True)
+    files = folder_files(run.stdout, "Activity")
+    todo = {n: i for n, i in files.items() if not (RAW / n).exists()}
+    # One line per pull in data/<profile>/pull.log; on failure, mtp-filetree's full output too.
+    # usb=none means macOS doesn't see the watch at all; usb=<serial> with 0 files means MTP failed.
+    DATA.mkdir(parents=True, exist_ok=True)
+    with open(DATA / "pull.log", "a") as log:
+        newest = max(files, default="-")
+        log.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} usb={serial or 'none'} exit={run.returncode} "
+                  f"lines={len(run.stdout.splitlines())} activity={len(files)} new={len(todo)} newest_on_watch={newest}\n")
+        if not files:
+            log.write(f"--- stdout\n{run.stdout}--- stderr\n{run.stderr}---\n")
     if not files:
-        sys.exit("No activity files found. Is the watch plugged in and unlocked? (Close Garmin Express / Android File Transfer.)")
+        why = run.stderr.strip().splitlines()[-1:] or ["no output"]
+        sys.exit(f"No activity files found (usb: {'seen' if serial else 'not seen'}, mtp-filetree: {why[0]}). "
+                 f"Details in {DATA / 'pull.log'}. Is the watch plugged in and unlocked? (Close Garmin Express / Android File Transfer.)")
     RAW.mkdir(parents=True, exist_ok=True)
     if serial:
         known.write_text(serial)
-    todo = {n: i for n, i in files.items() if not (RAW / n).exists()}
     print(f"{len(files)} on watch, {len(todo)} new")
     for k, (name, oid) in enumerate(sorted(todo.items(), reverse=True), 1):  # newest first
         part = RAW / (name + ".part")  # rename only when complete, so a yanked cable can't leave a half file
